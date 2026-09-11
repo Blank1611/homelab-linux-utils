@@ -27,15 +27,72 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 # ==============================================================================
-# TERMINAL COLORS & FORMATTING
+# TERMINAL CAPABILITIES & FORMATTING CONSOLE
 # ==============================================================================
-BOLD = "\033[1m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-RED = "\033[31m"
-CYAN = "\033[36m"
-BLUE = "\033[34m"
-NC = "\033[0m"
+class Console:
+    """
+    Encapsulates terminal formatting, stream routing, TTY detection,
+    and NO_COLOR environment compliance. Eliminates global state.
+    """
+
+    def __init__(self, color_mode: str = "auto", stream=None):
+        self.stream = stream or sys.stdout
+        self.color_mode = color_mode
+        self._enabled = self._determine_color_enabled(self.stream)
+
+    def _determine_color_enabled(self, target_stream) -> bool:
+        if self.color_mode == "never":
+            return False
+        if self.color_mode == "always":
+            return True
+        if "NO_COLOR" in os.environ:
+            return False
+        return hasattr(target_stream, "isatty") and target_stream.isatty()
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def bold(self, text: str) -> str:
+        return f"\033[1m{text}\033[0m" if self._enabled else str(text)
+
+    def green(self, text: str) -> str:
+        return f"\033[32m{text}\033[0m" if self._enabled else str(text)
+
+    def yellow(self, text: str) -> str:
+        return f"\033[33m{text}\033[0m" if self._enabled else str(text)
+
+    def red(self, text: str) -> str:
+        return f"\033[31m{text}\033[0m" if self._enabled else str(text)
+
+    def cyan(self, text: str) -> str:
+        return f"\033[36m{text}\033[0m" if self._enabled else str(text)
+
+    def blue(self, text: str) -> str:
+        return f"\033[34m{text}\033[0m" if self._enabled else str(text)
+
+    def print(self, *args, **kwargs) -> None:
+        if "file" not in kwargs:
+            kwargs["file"] = self.stream
+        if "flush" not in kwargs:
+            kwargs["flush"] = True
+        print(*args, **kwargs)
+
+    def print_error(self, *args, **kwargs) -> None:
+        kwargs["file"] = sys.stderr
+        if "flush" not in kwargs:
+            kwargs["flush"] = True
+        print(*args, **kwargs)
+
+    def rule(self, char: str = "=", length: int = 135, title: str = "") -> None:
+        if not title:
+            self.print(self.bold(char * length))
+        else:
+            padding = max(0, (length - len(title) - 2) // 2)
+            line = f"{char * padding} {title} {char * padding}"
+            if len(line) < length:
+                line += char * (length - len(line))
+            self.print(self.bold(line))
 
 
 # ==============================================================================
@@ -43,24 +100,29 @@ NC = "\033[0m"
 # ==============================================================================
 class StandardColoredFormatter(logging.Formatter):
     """
-    Standard POSIX/Python log formatter with ANSI-colored, unpadded level tags.
+    Standard POSIX/Python log formatter with ANSI-colored level tags.
     Format: %(asctime)s [%(levelname)s] [tid:%(thread)d] [%(name)s]: %(message)s
     """
 
-    LEVEL_COLORS = {
-        logging.DEBUG: BLUE,
-        logging.INFO: GREEN,
-        logging.WARNING: YELLOW,
-        logging.ERROR: RED,
-    }
+    def __init__(self, console: Console, fmt: Optional[str] = None, datefmt: Optional[str] = None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self.console = console
 
     def format(self, record: logging.LogRecord) -> str:
-        color = self.LEVEL_COLORS.get(record.levelno, NC)
-        orig_levelname = record.levelname
-        record.levelname = f"{color}{orig_levelname}{NC}"
-        formatted = super().format(record)
-        record.levelname = orig_levelname
-        return formatted
+        if self.console.enabled:
+            orig_levelname = record.levelname
+            if record.levelno == logging.DEBUG:
+                record.levelname = self.console.blue(orig_levelname)
+            elif record.levelno == logging.INFO:
+                record.levelname = self.console.green(orig_levelname)
+            elif record.levelno == logging.WARNING:
+                record.levelname = self.console.yellow(orig_levelname)
+            elif record.levelno == logging.ERROR:
+                record.levelname = self.console.red(orig_levelname)
+            formatted = super().format(record)
+            record.levelname = orig_levelname
+            return formatted
+        return super().format(record)
 
 
 class UnbufferedStreamHandler(logging.StreamHandler):
@@ -74,10 +136,11 @@ class UnbufferedStreamHandler(logging.StreamHandler):
 logger = logging.getLogger("drive_setup")
 
 
-def setup_logging(verbose: bool = True, quiet: bool = False) -> None:
+def setup_logging(console: Optional[Console] = None, verbose: bool = True, quiet: bool = False, stream=None) -> None:
     """
     Configure standard logging. Defaults to verbose (DEBUG) for personal homelab use.
     In quiet mode, sets WARNING level to suppress routine probe logs.
+    In JSON mode, stream is directed to sys.stderr.
     """
     if quiet:
         level = logging.WARNING
@@ -86,17 +149,20 @@ def setup_logging(verbose: bool = True, quiet: bool = False) -> None:
     else:
         level = logging.INFO
     logger.setLevel(level)
-    handler = UnbufferedStreamHandler(sys.stdout)
+
+    active_console = console or Console(stream=stream or sys.stdout)
+    output_stream = stream or active_console.stream
+    handler = UnbufferedStreamHandler(output_stream)
     handler.setLevel(level)
     fmt = "%(asctime)s [%(levelname)s] [tid:%(thread)d] [%(name)s]: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
-    handler.setFormatter(StandardColoredFormatter(fmt=fmt, datefmt=datefmt))
+    handler.setFormatter(StandardColoredFormatter(console=active_console, fmt=fmt, datefmt=datefmt))
     logger.handlers.clear()
     logger.addHandler(handler)
     logger.propagate = False
 
 
-# Initialize default logging on module load (defaults to verbose)
+# Initialize default logging on module load
 setup_logging(verbose=True)
 
 # Compatibility aliases
@@ -105,6 +171,39 @@ log_debug = logger.debug
 log_warn = logger.warning
 log_error = logger.error
 log_step = logger.info
+
+
+# ==============================================================================
+# EXCEPTIONS
+# ==============================================================================
+class StorageSetupError(Exception):
+    """Base exception for storage setup errors."""
+
+    def __init__(self, message: str, error_code: str = "E_GENERAL", remediation: str = "", extra: Optional[Dict] = None):
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+        self.remediation = remediation
+        self.extra = extra or {}
+
+
+class DeviceNotFoundError(StorageSetupError):
+    def __init__(self, device: str):
+        super().__init__(
+            f"Target device '{device}' is not a valid block device on this system.",
+            error_code="E_INVALID_DEVICE",
+            remediation="Check available block devices using './drive_setup.py --scan --json'.",
+        )
+
+
+class MultiPartitionDiskError(StorageSetupError):
+    def __init__(self, device: str, partitions: List[str]):
+        super().__init__(
+            f"Target '{device}' is a disk containing multiple partitions.",
+            error_code="E_MULTIPART_DISK",
+            remediation=f"Specify target partition explicitly with '-d {partitions[0]}'.",
+            extra={"partitions": partitions},
+        )
 
 
 # ==============================================================================
@@ -118,7 +217,12 @@ def get_default_user() -> str:
 # ==============================================================================
 # CENTRALIZED SUBPROCESS RUNNER (WITH COMMAND & OUTPUT LOGGING)
 # ==============================================================================
-def run_cmd(cmd: List[str], check: bool = False, capture_output: bool = True) -> subprocess.CompletedProcess:
+def run_cmd(
+    cmd: List[str],
+    check: bool = False,
+    capture_output: bool = True,
+    console: Optional[Console] = None,
+) -> subprocess.CompletedProcess:
     """
     Executes a subprocess command, logging the command line, stdout, stderr,
     and exit status. Provides actionable sudo guidance if permission denied.
@@ -140,8 +244,9 @@ def run_cmd(cmd: List[str], check: bool = False, capture_output: bool = True) ->
         res = subprocess.run(cmd)
         logger.debug(f"Exit code: {res.returncode}")
         if res.returncode != 0 and os.geteuid() != 0:
-            print(f"\n{RED}{BOLD}[PERMISSION ERROR]{NC} Command failed. If administrative privileges are needed, re-run with {BOLD}sudo{NC}:", file=sys.stderr)
-            print(f"  {BOLD}sudo {' '.join(sys.argv)}{NC}\n", file=sys.stderr)
+            con = console or Console(stream=sys.stderr)
+            con.print_error(f"\n{con.red(con.bold('[PERMISSION ERROR]'))} Command failed. If administrative privileges are needed, re-run with {con.bold('sudo')}:")
+            con.print_error(f"  {con.bold('sudo ' + ' '.join(sys.argv))}\n")
         if check and res.returncode != 0:
             raise subprocess.CalledProcessError(res.returncode, cmd)
         return res
@@ -220,39 +325,136 @@ class StepDecision:
     sub_text: Optional[str] = None
 
 
+@dataclass
+class UnconfiguredDevice:
+    device: BlockDevice
+    state: DeviceState
+    status: str
+    status_badge: str
+    details: str
+
+
+@dataclass
+class ScanReport:
+    configured_devices: List[Tuple[BlockDevice, DeviceState]]
+    unconfigured_devices: List[UnconfiguredDevice]
+    unconfigured_only: bool = False
+
+
+@dataclass
+class VerifyReport:
+    state: DeviceState
+    target_mountpoint: Optional[str]
+    target_user: str
+    all_healthy: bool
+    missing_steps: List[str]
+
+
+@dataclass
+class ActionPlan:
+    device: str
+    target_mountpoint: Optional[str]
+    target_user: str
+    fstype: str
+    label: Optional[str]
+    inode_reserve_type: str
+    reserved_percent: int
+    force: bool
+    decisions: List[StepDecision]
+    model: str = "Generic"
+    size: str = "Unknown"
+    execute_count: int = 0
+    skip_count: int = 0
+
+
 # ==============================================================================
-# USER CONFIRMATION HELPER
+# ERROR PRESENTER (STRATEGY PATTERN)
+# ==============================================================================
+class ErrorPresenter:
+    """Strategy for rendering errors in JSON or human-readable format."""
+
+    @staticmethod
+    def render_error(
+        error_code: str,
+        message: str,
+        remediation: str,
+        console: Optional[Console] = None,
+        json_mode: bool = False,
+        extra: Optional[Dict] = None,
+    ) -> None:
+        if json_mode:
+            payload = {
+                "status": "error",
+                "error_code": error_code,
+                "message": message,
+                "remediation": remediation,
+            }
+            if extra:
+                payload.update(extra)
+            print(json.dumps(payload, indent=2), flush=True)
+        else:
+            con = console or Console(stream=sys.stderr)
+            con.print_error(f"\n{con.red(con.bold('[ERROR]'))} {message}")
+            if extra and "partitions" in extra:
+                con.print_error("  Partitions detected:")
+                for p in extra["partitions"]:
+                    con.print_error(f"  → {p}")
+            if remediation:
+                con.print_error(f"        {con.bold('Remediation:')} {remediation}\n")
+
+
+# ==============================================================================
+# USER CONFIRMATION HELPER (FAIL-FAST NON-INTERACTIVE GUARDRAIL)
 # ==============================================================================
 def confirm(
     explanation: str,
     action_message: str,
     cmd: Optional[Union[List[str], str]] = None,
     assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
+    step_name: str = "",
 ) -> bool:
-    print(f"\n--------------------------------------------------", flush=True)
-    print(f"{BOLD}UPCOMING ACTION:{NC} {action_message}", flush=True)
-    if cmd is not None:
-        if isinstance(cmd, list):
-            cmd_str = " ".join(cmd)
-            print(f"{CYAN}{BOLD}Command:{NC}         {BOLD}{cmd_str}{NC}", flush=True)
-            print(f"{CYAN}Exec List:{NC}       {cmd}", flush=True)
-        else:
-            print(f"{CYAN}{BOLD}Command:{NC}         {BOLD}{cmd}{NC}", flush=True)
-    print(f"{YELLOW}Explanation:{NC}     {explanation}", flush=True)
-    print(f"--------------------------------------------------", flush=True)
+    con = console or Console(stream=sys.stdout)
+
+    if not json_mode:
+        con.print("\n" + "-" * 50)
+        con.print(f"{con.bold('UPCOMING ACTION:')} {action_message}")
+        if cmd is not None:
+            if isinstance(cmd, list):
+                cmd_str = " ".join(cmd)
+                con.print(f"{con.cyan(con.bold('Command:'))}         {con.bold(cmd_str)}")
+                con.print(f"{con.cyan('Exec List:')}       {cmd}")
+            else:
+                con.print(f"{con.cyan(con.bold('Command:'))}         {con.bold(cmd)}")
+        con.print(f"{con.yellow('Explanation:')}     {explanation}")
+        con.print("-" * 50)
 
     if assume_yes:
-        print(f"{GREEN}[INFO] --yes flag detected. Proceeding automatically...{NC}", flush=True)
+        if not json_mode:
+            con.print(f"{con.green('[INFO]')} --yes flag detected. Proceeding automatically...")
         return True
+
+    if not sys.stdin.isatty():
+        logger.error("Non-interactive terminal detected without '-y' / '--yes'. Cannot prompt for confirmation.")
+        ErrorPresenter.render_error(
+            error_code="E_NON_INTERACTIVE",
+            message="Operation requires confirmation, but environment is non-interactive.",
+            remediation="Pass '-y' or '--yes' to proceed non-interactively.",
+            console=con,
+            json_mode=json_mode,
+            extra={"step": step_name} if step_name else None,
+        )
+        sys.exit(2)
 
     try:
         response = input("Do you want to proceed with this step? (y/N): ").strip().lower()
         if response in ("y", "yes"):
             return True
-        print(f"{RED}[SKIPPED] User cancelled the action.{NC}", flush=True)
+        con.print(f"{con.red('[SKIPPED]')} User cancelled the action.")
         return False
     except (KeyboardInterrupt, EOFError):
-        print(f"\n{RED}[ABORTED] Operation interrupted by user.{NC}", file=sys.stderr, flush=True)
+        con.print_error(f"\n{con.red('[ABORTED]')} Operation interrupted by user.")
         sys.exit(1)
 
 
@@ -337,7 +539,7 @@ class FstabManager:
 
         shutil.copymode(cls.FSTAB_PATH, tmp_path)
         os.replace(tmp_path, cls.FSTAB_PATH)
-        print(f"{GREEN}[SUCCESS] /etc/fstab successfully configured with UUID={uuid}.{NC}", flush=True)
+        logger.info(f"Successfully configured /etc/fstab with UUID={uuid}.")
 
 
 # ==============================================================================
@@ -583,175 +785,290 @@ class DeviceInspector:
 
 
 # ==============================================================================
-# AUDIT MODE (--verify)
+# AUDIT MODE (--verify) & PRESENTER
 # ==============================================================================
-def do_verify(device_path: str, target_mountpoint: Optional[str], target_user: Optional[str] = None) -> int:
+def do_verify(
+    device_path: str,
+    target_mountpoint: Optional[str] = None,
+    target_user: Optional[str] = None,
+) -> VerifyReport:
+    """Pure inspection logic for verifying storage device state against target expectations."""
     target_user = target_user or get_default_user()
     state = DeviceInspector.inspect(device_path, target_mountpoint, target_user)
 
-    print(f"\n{BOLD}======================================================================{NC}", flush=True)
-    print(f"                {CYAN}{BOLD}STORAGE DEVICE AUDIT: {state.device_path}{NC}", flush=True)
-    print(f"{BOLD}======================================================================{NC}", flush=True)
-
-    if os.geteuid() != 0:
-        print(f"{YELLOW}[NOTICE] Audit running without root privileges (sudo).{NC}")
-        print(f"         Ext4 geometry metrics (tune2fs) and raw device attributes may be restricted.")
-        print(f"         For complete audit details, run with: {BOLD}sudo {' '.join(sys.argv)}{NC}\n", flush=True)
-
     if not state.is_block_device:
-        logger.error(f"Target device '{device_path}' is not a valid block device.")
-        return 1
+        raise DeviceNotFoundError(device_path)
 
-    # Multi-partition warning if whole disk was queried without a clear match
     if state.device and state.device.type == "disk" and len(state.child_partitions) > 1 and not state.resolved_from_parent:
-        logger.warning(f"Target '{device_path}' is a disk containing multiple partitions:")
-        for p in state.child_partitions:
-            print(f"  → {p.path} ({p.size}, {p.fstype or 'no fs'}, mounts: {p.mountpoints})", flush=True)
-        print(f"\nPlease specify the exact partition to verify (e.g. -d {state.child_partitions[0].path}).", flush=True)
-        return 1
-
-    dev_model = "Generic"
-    if state.device and state.device.model:
-        dev_model = state.device.model
-    elif state.parent_device and state.parent_device.model:
-        dev_model = state.parent_device.model
-
-    dev_size = state.device.size if state.device and state.device.size else "Unknown"
-    dev_type = state.device.type if state.device and state.device.type else "block"
-
-    if state.resolved_from_parent and state.parent_device:
-        dev_header = f"{BOLD}{state.device_path}{NC} (Parent: {state.parent_device.path}, {dev_model}, {dev_size}, {dev_type})"
-    else:
-        dev_header = f"{BOLD}{state.device_path}{NC} ({dev_model}, {dev_size}, {dev_type})"
-
-    print(f"Target Device:     {dev_header}", flush=True)
-    print(f"Target Mountpoint: {BOLD}{target_mountpoint or '[None Specified]'}{NC}", flush=True)
-    print(f"Target Owner:      {BOLD}{target_user}{NC}", flush=True)
-    print("----------------------------------------------------------------------", flush=True)
-    print(f"{BOLD}COMPONENT AUDIT:{NC}", flush=True)
+        raise MultiPartitionDiskError(device_path, [p.path for p in state.child_partitions])
 
     all_healthy = True
     missing_steps: List[str] = []
 
     # 1. Filesystem (--format / -l)
-    if state.is_formatted:
-        print(f"  [{GREEN}✓{NC}] Filesystem (--format):       {BOLD}{state.fstype}{NC} | UUID: {state.uuid or 'none'} | Label (-l): \"{state.label or 'none'}\"", flush=True)
-    else:
-        print(f"  [{RED}✗{NC}] Filesystem (--format):       {RED}No recognizable filesystem detected (unformatted){NC}", flush=True)
+    if not state.is_formatted:
         all_healthy = False
         missing_steps.append("--format -l <label> (format drive as ext4)")
 
     # 2. Mount status (--mount / -m)
     if target_mountpoint:
         if target_mountpoint in state.current_mounts:
-            print(f"  [{GREEN}✓{NC}] Active Mount (--mount):      Mounted at {BOLD}{target_mountpoint}{NC} (-m)", flush=True)
+            pass
         elif state.is_mounted:
-            other_mount = state.current_mounts[0]
-            print(f"  [{YELLOW}!{NC}] Active Mount (--mount):      {YELLOW}Mounted at '{other_mount}', expected '{target_mountpoint}'{NC}", flush=True)
             all_healthy = False
             missing_steps.append(f"--mount (remount to {target_mountpoint})")
         else:
-            print(f"  [{RED}✗{NC}] Active Mount (--mount):      {RED}Device is currently unmounted{NC}", flush=True)
             all_healthy = False
             missing_steps.append(f"--mount (mount device to {target_mountpoint})")
-    else:
-        if state.is_mounted:
-            print(f"  [{CYAN}ℹ{NC}] Active Mount (--mount):      Currently mounted at: {', '.join(state.current_mounts)}", flush=True)
-        else:
-            print(f"  [{CYAN}ℹ{NC}] Active Mount (--mount):      Not mounted", flush=True)
 
     # 3. Persistence (--fstab)
     if state.in_fstab and state.fstab_entry:
-        if target_mountpoint:
-            if state.fstab_entry.mountpoint == target_mountpoint:
-                print(f"  [{GREEN}✓{NC}] Persistence (--fstab):       Valid persistent entry found in /etc/fstab for {BOLD}{target_mountpoint}{NC}", flush=True)
-            else:
-                print(f"  [{YELLOW}!{NC}] Persistence (--fstab):       {YELLOW}/etc/fstab entry points to '{state.fstab_entry.mountpoint}' instead of '{target_mountpoint}'{NC}", flush=True)
-                all_healthy = False
-                missing_steps.append(f"--fstab (update /etc/fstab entry to {target_mountpoint})")
-        else:
-            print(f"  [{GREEN}✓{NC}] Persistence (--fstab):       Found in /etc/fstab: {state.fstab_entry.spec} -> {state.fstab_entry.mountpoint}", flush=True)
+        if target_mountpoint and state.fstab_entry.mountpoint != target_mountpoint:
+            all_healthy = False
+            missing_steps.append(f"--fstab (update /etc/fstab entry to {target_mountpoint})")
     else:
-        print(f"  [{RED}✗{NC}] Persistence (--fstab):       {RED}No persistent entry found in /etc/fstab for this device/UUID{NC}", flush=True)
         all_healthy = False
         missing_steps.append("--fstab (add persistent mount entry)")
 
     # 4. Target Directory Permissions (--perms / -u)
     if target_mountpoint:
         if state.mountpoint_exists:
-            owner_matches = state.mountpoint_owner == target_user
-            if owner_matches:
-                print(f"  [{GREEN}✓{NC}] Permissions (--perms):       Directory exists | Owner (-u): {state.mountpoint_owner} | Perms: {state.mountpoint_perms}", flush=True)
-            else:
-                print(f"  [{YELLOW}!{NC}] Permissions (--perms):       {YELLOW}Directory exists | Owner: {state.mountpoint_owner} (expected -u: {target_user}) | Perms: {state.mountpoint_perms}{NC}", flush=True)
+            if state.mountpoint_owner != target_user:
                 missing_steps.append(f"--perms (set ownership to {target_user})")
         else:
-            print(f"  [{RED}✗{NC}] Permissions (--perms):       {RED}Directory '{target_mountpoint}' does not exist yet{NC}", flush=True)
             missing_steps.append(f"--perms (create directory and set ownership)")
 
-    if state.fstype == "ext4":
-        print("----------------------------------------------------------------------", flush=True)
-        print(f"{BOLD}STORAGE EFFICIENCY & ALLOCATION:{NC}", flush=True)
+    return VerifyReport(
+        state=state,
+        target_mountpoint=target_mountpoint,
+        target_user=target_user,
+        all_healthy=(all_healthy and len(missing_steps) == 0),
+        missing_steps=missing_steps,
+    )
 
-        if state.total_inodes is not None:
-            overhead_mb = (state.inode_table_overhead_bytes or 0) / (1024 * 1024)
-            if overhead_mb >= 1024:
-                overhead_str = f"{overhead_mb / 1024:.2f} GB"
-            else:
-                overhead_str = f"{overhead_mb:.1f} MB"
 
-            used_inodes_str = f"{state.used_inodes:,}" if state.used_inodes is not None else "unknown"
-            total_inodes_str = f"{state.total_inodes:,}" if state.total_inodes is not None else "unknown"
-            free_inodes_str = f"{state.free_inodes:,}" if state.free_inodes is not None else "unknown"
+class VerifyPresenter:
+    """Strategy for rendering verification reports in JSON or human-readable table."""
 
-            profile_str = f" [Profile: {state.detected_inode_profile}]" if state.detected_inode_profile else ""
-            print(f"  Inodes (-irt):                   {total_inodes_str} total ({used_inodes_str} used, {free_inodes_str} free){profile_str} | Table Overhead: {overhead_str}", flush=True)
+    @staticmethod
+    def render_table(report: VerifyReport, console: Console) -> int:
+        state = report.state
+        target_mountpoint = report.target_mountpoint
+        target_user = report.target_user
 
-            res_bytes = state.reserved_space_bytes or 0
-            res_gb = res_bytes / (1024 * 1024 * 1024)
-            res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
+        dev_model = "Generic"
+        if state.device and state.device.model:
+            dev_model = state.device.model
+        elif state.parent_device and state.parent_device.model:
+            dev_model = state.parent_device.model
 
-            print(f"  Reserved Space (-trb / -r):      {res_pct:.1f}% ({res_gb:.1f} GB reserved for root) [Tool Target: 1%]", flush=True)
+        dev_size = state.device.size if state.device and state.device.size else "Unknown"
+        dev_type = state.device.type if state.device and state.device.type else "block"
 
-            if res_pct >= 3.0:
-                target_1pct_gb = (res_bytes / (res_pct / 100)) * 0.01 / (1024 * 1024 * 1024) if res_pct > 0 else 0
-                reclaim_gb = res_gb - target_1pct_gb
-                print(f"  {YELLOW}[!]{NC} Optimization Notice: {res_pct:.0f}% reserved space detected (~{res_gb:.1f} GB).", flush=True)
-                print(f"      Reclaim ~{reclaim_gb:.1f} GB by tuning to 1%: {BOLD}sudo ./drive_setup.py -d {state.device_path} -trb -r 1{NC}", flush=True)
+        console.print(f"\n{console.bold('=' * 70)}")
+        console.print(f"                {console.cyan(console.bold('STORAGE DEVICE AUDIT: ' + state.device_path))}")
+        console.print(f"{console.bold('=' * 70)}")
+
+        if os.geteuid() != 0:
+            console.print(f"{console.yellow('[NOTICE]')} Audit running without root privileges (sudo).")
+            console.print("         Ext4 geometry metrics (tune2fs) and raw device attributes may be restricted.")
+            console.print(f"         For complete audit details, run with: {console.bold('sudo ' + ' '.join(sys.argv))}\n")
+
+        if state.resolved_from_parent and state.parent_device:
+            dev_header = f"{console.bold(state.device_path)} (Parent: {state.parent_device.path}, {dev_model}, {dev_size}, {dev_type})"
         else:
-            if os.geteuid() != 0:
-                print(f"  {YELLOW}[!]{NC} Ext4 allocation statistics could not be retrieved (permission denied).", flush=True)
-                print(f"      To inspect inodes & reserved blocks via tune2fs, please run with {BOLD}sudo{NC}:", flush=True)
-                print(f"      {BOLD}sudo {' '.join(sys.argv)}{NC}", flush=True)
+            dev_header = f"{console.bold(state.device_path)} ({dev_model}, {dev_size}, {dev_type})"
+
+        console.print(f"Target Device:     {dev_header}")
+        console.print(f"Target Mountpoint: {console.bold(target_mountpoint or '[None Specified]')}")
+        console.print(f"Target Owner:      {console.bold(target_user)}")
+        console.print("-" * 70)
+        console.print(f"{console.bold('COMPONENT AUDIT:')}")
+
+        # 1. Filesystem (--format / -l)
+        if state.is_formatted:
+            console.print(f"  [{console.green('✓')}] Filesystem (--format):       {console.bold(state.fstype or 'unknown')} | UUID: {state.uuid or 'none'} | Label (-l): \"{state.label or 'none'}\"")
+        else:
+            console.print(f"  [{console.red('✗')}] Filesystem (--format):       {console.red('No recognizable filesystem detected (unformatted)')}")
+
+        # 2. Mount status (--mount / -m)
+        if target_mountpoint:
+            if target_mountpoint in state.current_mounts:
+                console.print(f"  [{console.green('✓')}] Active Mount (--mount):      Mounted at {console.bold(target_mountpoint)} (-m)")
+            elif state.is_mounted:
+                other_mount = state.current_mounts[0]
+                other_msg = f"Mounted at '{other_mount}', expected '{target_mountpoint}'"
+                console.print(f"  [{console.yellow('!')}] Active Mount (--mount):      {console.yellow(other_msg)}")
             else:
-                print(f"  {YELLOW}[!]{NC} tune2fs could not read ext4 geometry for {state.device_path}.", flush=True)
+                console.print(f"  [{console.red('✗')}] Active Mount (--mount):      {console.red('Device is currently unmounted')}")
+        else:
+            if state.is_mounted:
+                console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Currently mounted at: {', '.join(state.current_mounts)}")
+            else:
+                console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Not mounted")
 
-    print("----------------------------------------------------------------------", flush=True)
-    if all_healthy and not missing_steps:
-        print(f"{GREEN}{BOLD}✓ AUDIT RESULT: Storage setup is complete, healthy, and persistent!{NC}", flush=True)
-        print("No setup actions required.", flush=True)
-        print(f"{BOLD}======================================================================{NC}\n", flush=True)
-        return 0
-    else:
-        print(f"{YELLOW}{BOLD}⚠ AUDIT RESULT: Storage setup is incomplete or needs adjustment.{NC}", flush=True)
-        print("Recommended actions:", flush=True)
-        for step in missing_steps:
-            print(f"  {BOLD}→{NC} {step}", flush=True)
-        cmd_hint = f"sudo ./drive_setup.py -d {state.device_path} -m {target_mountpoint or '/mnt/<dir>'} --all"
-        print(f"\nRun suggested actions via: {BOLD}{cmd_hint}{NC}", flush=True)
-        print(f"{BOLD}======================================================================{NC}\n", flush=True)
-        return 1
+        # 3. Persistence (--fstab)
+        if state.in_fstab and state.fstab_entry:
+            if target_mountpoint:
+                if state.fstab_entry.mountpoint == target_mountpoint:
+                    console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Valid persistent entry found in /etc/fstab for {console.bold(target_mountpoint)}")
+                else:
+                    fstab_msg = f"/etc/fstab entry points to '{state.fstab_entry.mountpoint}' instead of '{target_mountpoint}'"
+                    console.print(f"  [{console.yellow('!')}] Persistence (--fstab):       {console.yellow(fstab_msg)}")
+            else:
+                console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Found in /etc/fstab: {state.fstab_entry.spec} -> {state.fstab_entry.mountpoint}")
+        else:
+            console.print(f"  [{console.red('✗')}] Persistence (--fstab):       {console.red('No persistent entry found in /etc/fstab for this device/UUID')}")
+
+        # 4. Target Directory Permissions (--perms / -u)
+        if target_mountpoint:
+            if state.mountpoint_exists:
+                if state.mountpoint_owner == target_user:
+                    console.print(f"  [{console.green('✓')}] Permissions (--perms):       Directory exists | Owner (-u): {state.mountpoint_owner} | Perms: {state.mountpoint_perms}")
+                else:
+                    perm_msg = f"Directory exists | Owner: {state.mountpoint_owner} (expected -u: {target_user}) | Perms: {state.mountpoint_perms}"
+                    console.print(f"  [{console.yellow('!')}] Permissions (--perms):       {console.yellow(perm_msg)}")
+            else:
+                missing_dir_msg = f"Directory '{target_mountpoint}' does not exist yet"
+                console.print(f"  [{console.red('✗')}] Permissions (--perms):       {console.red(missing_dir_msg)}")
+
+        if state.fstype == "ext4":
+            console.print("-" * 70)
+            console.print(f"{console.bold('STORAGE EFFICIENCY & ALLOCATION:')}")
+
+            if state.total_inodes is not None:
+                overhead_mb = (state.inode_table_overhead_bytes or 0) / (1024 * 1024)
+                if overhead_mb >= 1024:
+                    overhead_str = f"{overhead_mb / 1024:.2f} GB"
+                else:
+                    overhead_str = f"{overhead_mb:.1f} MB"
+
+                used_inodes_str = f"{state.used_inodes:,}" if state.used_inodes is not None else "unknown"
+                total_inodes_str = f"{state.total_inodes:,}" if state.total_inodes is not None else "unknown"
+                free_inodes_str = f"{state.free_inodes:,}" if state.free_inodes is not None else "unknown"
+
+                profile_str = f" [Profile: {state.detected_inode_profile}]" if state.detected_inode_profile else ""
+                console.print(f"  Inodes (-irt):                   {total_inodes_str} total ({used_inodes_str} used, {free_inodes_str} free){profile_str} | Table Overhead: {overhead_str}")
+
+                res_bytes = state.reserved_space_bytes or 0
+                res_gb = res_bytes / (1024 * 1024 * 1024)
+                res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
+
+                console.print(f"  Reserved Space (-trb / -r):      {res_pct:.1f}% ({res_gb:.1f} GB reserved for root) [Tool Target: 1%]")
+
+                if res_pct >= 3.0:
+                    target_1pct_gb = (res_bytes / (res_pct / 100)) * 0.01 / (1024 * 1024 * 1024) if res_pct > 0 else 0
+                    reclaim_gb = res_gb - target_1pct_gb
+                    console.print(f"  {console.yellow('[!]')} Optimization Notice: {res_pct:.0f}% reserved space detected (~{res_gb:.1f} GB).")
+                    console.print(f"      Reclaim ~{reclaim_gb:.1f} GB by tuning to 1%: {console.bold(f'sudo ./drive_setup.py -d {state.device_path} -trb -r 1')}")
+            else:
+                if os.geteuid() != 0:
+                    console.print(f"  {console.yellow('[!]')} Ext4 allocation statistics could not be retrieved (permission denied).")
+                    console.print(f"      To inspect inodes & reserved blocks via tune2fs, please run with {console.bold('sudo')}:")
+                    console.print(f"      {console.bold('sudo ' + ' '.join(sys.argv))}")
+                else:
+                    console.print(f"  {console.yellow('[!]')} tune2fs could not read ext4 geometry for {state.device_path}.")
+
+        console.print("-" * 70)
+        if report.all_healthy:
+            console.print(f"{console.green(console.bold('✓ AUDIT RESULT: Storage setup is complete, healthy, and persistent!'))}")
+            console.print("No setup actions required.")
+            console.print(f"{console.bold('=' * 70)}\n")
+            return 0
+        else:
+            console.print(f"{console.yellow(console.bold('⚠ AUDIT RESULT: Storage setup is incomplete or needs adjustment.'))}")
+            console.print("Recommended actions:")
+            for step in report.missing_steps:
+                console.print(f"  {console.bold('→')} {step}")
+            cmd_hint = f"sudo ./drive_setup.py -d {state.device_path} -m {target_mountpoint or '/mnt/<dir>'} --all"
+            console.print(f"\nRun suggested actions via: {console.bold(cmd_hint)}")
+            console.print(f"{console.bold('=' * 70)}\n")
+            return 1
+
+    @staticmethod
+    def render_json(report: VerifyReport) -> int:
+        state = report.state
+        dev_model = "Generic"
+        if state.device and state.device.model:
+            dev_model = state.device.model
+        elif state.parent_device and state.parent_device.model:
+            dev_model = state.parent_device.model
+        dev_size = state.device.size if state.device and state.device.size else "Unknown"
+        dev_type = state.device.type if state.device and state.device.type else "block"
+
+        payload = {
+            "status": "success",
+            "mode": "verify",
+            "device": state.device_path,
+            "original_input_path": state.original_input_path,
+            "resolved_from_parent": state.resolved_from_parent,
+            "parent_device": state.parent_device.path if state.parent_device else None,
+            "model": dev_model,
+            "size": dev_size,
+            "type": dev_type,
+            "target_mountpoint": report.target_mountpoint,
+            "target_user": report.target_user,
+            "components": {
+                "filesystem": {
+                    "healthy": state.is_formatted,
+                    "fstype": state.fstype,
+                    "uuid": state.uuid,
+                    "label": state.label,
+                },
+                "mount": {
+                    "healthy": bool(report.target_mountpoint and report.target_mountpoint in state.current_mounts) if report.target_mountpoint else state.is_mounted,
+                    "is_mounted": state.is_mounted,
+                    "current_mounts": state.current_mounts,
+                    "expected_mountpoint": report.target_mountpoint,
+                },
+                "persistence": {
+                    "healthy": bool(state.in_fstab and (not report.target_mountpoint or (state.fstab_entry and state.fstab_entry.mountpoint == report.target_mountpoint))),
+                    "in_fstab": state.in_fstab,
+                    "fstab_entry": {
+                        "spec": state.fstab_entry.spec,
+                        "mountpoint": state.fstab_entry.mountpoint,
+                        "fstype": state.fstab_entry.vfstype,
+                        "options": state.fstab_entry.mntops,
+                    } if state.fstab_entry else None,
+                },
+                "permissions": {
+                    "healthy": bool(report.target_mountpoint and state.mountpoint_exists and state.mountpoint_owner == report.target_user),
+                    "directory_exists": state.mountpoint_exists,
+                    "owner": state.mountpoint_owner,
+                    "expected_owner": report.target_user,
+                    "perms": state.mountpoint_perms,
+                } if report.target_mountpoint else None,
+            },
+            "efficiency": {
+                "total_inodes": state.total_inodes,
+                "used_inodes": state.used_inodes,
+                "free_inodes": state.free_inodes,
+                "inode_profile": state.detected_inode_profile,
+                "inode_table_overhead_bytes": state.inode_table_overhead_bytes,
+                "reserved_space_bytes": state.reserved_space_bytes,
+                "reserved_percent": state.reserved_percent,
+            } if state.fstype == "ext4" else None,
+            "all_healthy": report.all_healthy,
+            "missing_steps": report.missing_steps,
+            "recommended_command": f"sudo ./drive_setup.py -d {state.device_path} -m {report.target_mountpoint or '/mnt/storage'} --all" if report.missing_steps else None,
+        }
+        print(json.dumps(payload, indent=2), flush=True)
+        return 0 if report.all_healthy else 1
 
 
 # ==============================================================================
-# DISCOVERY MODE (--scan)
+# DISCOVERY MODE (--scan) & PRESENTER
 # ==============================================================================
-def do_scan(unconfigured_only: bool = False) -> int:
+def do_scan(unconfigured_only: bool = False) -> ScanReport:
+    """Pure inspection logic for discovering configured and unconfigured storage devices."""
     logger.info("Scanning system block devices via lsblk...")
     all_devs = DeviceInspector.get_all_block_devices()
     if not all_devs:
-        logger.error("No block devices found or lsblk is unavailable.")
-        return 1
+        raise StorageSetupError(
+            "No block devices found or lsblk is unavailable.",
+            error_code="E_NO_BLOCK_DEVICES",
+            remediation="Ensure lsblk is installed and accessible.",
+        )
 
     candidates: List[BlockDevice] = []
 
@@ -780,9 +1097,8 @@ def do_scan(unconfigured_only: bool = False) -> int:
     for d in all_devs:
         collect(d)
 
-    # 1. Inspect all candidates in memory first (prevents log interleaved pollution)
     configured_devices: List[Tuple[BlockDevice, DeviceState]] = []
-    unconfigured_devices: List[Tuple[BlockDevice, DeviceState, str, str]] = []
+    unconfigured_devices: List[UnconfiguredDevice] = []
 
     for dev in candidates:
         state = DeviceInspector.inspect(dev.path)
@@ -793,137 +1109,243 @@ def do_scan(unconfigured_only: bool = False) -> int:
         else:
             status_badge = ""
             details = ""
+            status_clean = "UNKNOWN"
             if not state.is_formatted:
-                status_badge = f"{YELLOW}[RAW / UNFORMATTED]{NC}"
+                status_clean = "RAW_UNFORMATTED"
+                status_badge = "[RAW / UNFORMATTED]"
                 details = "Ready for full setup with --format"
             elif not state.is_mounted and not state.in_fstab:
-                status_badge = f"{CYAN}[UNCONFIGURED FS]{NC}"
+                status_clean = "UNCONFIGURED_FS"
+                status_badge = "[UNCONFIGURED FS]"
                 details = "Formatted, unmounted, missing fstab"
             elif state.is_mounted and not state.in_fstab:
-                status_badge = f"{YELLOW}[TEMP MOUNTED]{NC}"
+                status_clean = "TEMP_MOUNTED"
+                status_badge = "[TEMP MOUNTED]"
                 details = f"Mounted at '{state.current_mounts[0]}', missing fstab"
             elif not state.is_mounted and state.in_fstab:
-                status_badge = f"{YELLOW}[UNMOUNTED IN FSTAB]{NC}"
+                status_clean = "UNMOUNTED_IN_FSTAB"
+                status_badge = "[UNMOUNTED IN FSTAB]"
                 details = "Listed in fstab, but currently unmounted"
 
-            unconfigured_devices.append((dev, state, status_badge, details))
+            unconfigured_devices.append(
+                UnconfiguredDevice(
+                    device=dev,
+                    state=state,
+                    status=status_clean,
+                    status_badge=status_badge,
+                    details=details,
+                )
+            )
 
-    # --------------------------------------------------------------------------
-    # SECTION 1: CONFIGURED & ACTIVE STORAGE DEVICES (Skipped if unconfigured_only)
-    # --------------------------------------------------------------------------
-    if not unconfigured_only:
-        print(f"\n{BOLD}{'=' * 135}{NC}", flush=True)
-        print(f"{' ' * 45}{GREEN}{BOLD}CONFIGURED & ACTIVE STORAGE DEVICES{NC}", flush=True)
-        print(f"{BOLD}{'=' * 135}{NC}", flush=True)
+    return ScanReport(
+        configured_devices=configured_devices,
+        unconfigured_devices=unconfigured_devices,
+        unconfigured_only=unconfigured_only,
+    )
 
-        header_cfg = f"{'DEVICE':<14} {'SIZE':<8} {'FS (LABEL)':<22} {'MOUNTPOINT':<24} {'FSTAB':<7} {'OWNER (PERMS)':<20} {'INODES (OVERHEAD)':<26} {'RESERVED SPACE'}"
-        print(BOLD + header_cfg + NC, flush=True)
-        print("-" * 135, flush=True)
 
-        has_sudo_na = False
-        if not configured_devices:
-            print("  No configured storage devices detected.", flush=True)
-        else:
-            for dev, state in configured_devices:
-                dev_path = dev.path
-                size_str = dev.size or (state.device.size if state.device else "Unknown")
-                fs_label = state.fstype or "unknown"
-                if state.label:
-                    fs_label = f'{fs_label} ("{state.label}")'
-                fs_label_str = fs_label[:21]
+class ScanPresenter:
+    """Strategy for rendering system storage scan results in JSON or human-readable table."""
 
-                mp_str = (state.current_mounts[0] if state.current_mounts else "-")[:23]
-                fstab_cell = f"{GREEN}[✓]{NC}    " if state.in_fstab else f"{RED}[✗]{NC}    "
+    @staticmethod
+    def render_table(report: ScanReport, console: Console) -> int:
+        configured_devices = report.configured_devices
+        unconfigured_devices = report.unconfigured_devices
 
-                owner_perms = "-"
-                if state.mountpoint_owner:
-                    perms = state.mountpoint_perms or "???"
-                    owner_perms = f"{state.mountpoint_owner} ({perms})"
-                owner_perms_str = owner_perms[:19]
+        # --------------------------------------------------------------------------
+        # SECTION 1: CONFIGURED & ACTIVE STORAGE DEVICES (Skipped if unconfigured_only)
+        # --------------------------------------------------------------------------
+        if not report.unconfigured_only:
+            console.rule("=", 135)
+            console.print(f"{' ' * 45}{console.green(console.bold('CONFIGURED & ACTIVE STORAGE DEVICES'))}")
+            console.rule("=", 135)
 
-                # Metric 1: Inodes & Table Overhead
-                # Metric 2: Reserved Space & Percentage
-                if state.fstype == "ext4":
-                    if os.geteuid() == 0 and state.inode_table_overhead_bytes is not None and state.reserved_space_bytes is not None:
-                        # Inodes count
-                        if state.total_inodes is not None:
-                            if state.total_inodes >= 1_000_000:
-                                in_cnt = f"{state.total_inodes / 1_000_000:.1f}M"
-                            elif state.total_inodes >= 1_000:
-                                in_cnt = f"{state.total_inodes / 1_000:.1f}K"
+            header_cfg = f"{'DEVICE':<14} {'SIZE':<8} {'FS (LABEL)':<22} {'MOUNTPOINT':<24} {'FSTAB':<7} {'OWNER (PERMS)':<20} {'INODES (OVERHEAD)':<26} {'RESERVED SPACE'}"
+            console.print(console.bold(header_cfg))
+            console.print("-" * 135)
+
+            has_sudo_na = False
+            if not configured_devices:
+                console.print("  No configured storage devices detected.")
+            else:
+                for dev, state in configured_devices:
+                    dev_path = dev.path
+                    size_str = dev.size or (state.device.size if state.device else "Unknown")
+                    fs_label = state.fstype or "unknown"
+                    if state.label:
+                        fs_label = f'{fs_label} ("{state.label}")'
+                    fs_label_str = fs_label[:21]
+
+                    mp_str = (state.current_mounts[0] if state.current_mounts else "-")[:23]
+                    fstab_cell = f"{console.green('[✓]')}    " if state.in_fstab else f"{console.red('[✗]')}    "
+
+                    owner_perms = "-"
+                    if state.mountpoint_owner:
+                        perms = state.mountpoint_perms or "???"
+                        owner_perms = f"{state.mountpoint_owner} ({perms})"
+                    owner_perms_str = owner_perms[:19]
+
+                    # Ext4 metrics
+                    if state.fstype == "ext4":
+                        if os.geteuid() == 0 and state.inode_table_overhead_bytes is not None and state.reserved_space_bytes is not None:
+                            if state.total_inodes is not None:
+                                if state.total_inodes >= 1_000_000:
+                                    in_cnt = f"{state.total_inodes / 1_000_000:.1f}M"
+                                elif state.total_inodes >= 1_000:
+                                    in_cnt = f"{state.total_inodes / 1_000:.1f}K"
+                                else:
+                                    in_cnt = str(state.total_inodes)
                             else:
-                                in_cnt = str(state.total_inodes)
+                                in_cnt = "unknown"
+
+                            overhead_mb = state.inode_table_overhead_bytes / (1024 * 1024)
+                            ovh_str = f"{overhead_mb / 1024:.1f} GB" if overhead_mb >= 1024 else f"{overhead_mb:.0f} MB"
+
+                            if state.detected_inode_profile and state.detected_inode_profile != "default":
+                                inode_text = f"{in_cnt} [{state.detected_inode_profile}] ({ovh_str})"
+                            else:
+                                inode_text = f"{in_cnt} ({ovh_str} ovh)"
+
+                            res_gb = state.reserved_space_bytes / (1024 * 1024 * 1024)
+                            res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
+                            reserved_text = f"{res_gb:.1f} GB ({res_pct:.1f}%)"
+
+                            inode_cell = f"{inode_text:<26}"
+                            reserved_cell = reserved_text
                         else:
-                            in_cnt = "unknown"
-
-                        overhead_mb = state.inode_table_overhead_bytes / (1024 * 1024)
-                        ovh_str = f"{overhead_mb / 1024:.1f} GB" if overhead_mb >= 1024 else f"{overhead_mb:.0f} MB"
-
-                        if state.detected_inode_profile and state.detected_inode_profile != "default":
-                            inode_text = f"{in_cnt} [{state.detected_inode_profile}] ({ovh_str})"
-                        else:
-                            inode_text = f"{in_cnt} ({ovh_str} ovh)"
-
-                        res_gb = state.reserved_space_bytes / (1024 * 1024 * 1024)
-                        res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
-                        reserved_text = f"{res_gb:.1f} GB ({res_pct:.1f}%)"
-
-                        inode_cell = f"{inode_text:<26}"
-                        reserved_cell = reserved_text
+                            inode_cell = f"{console.yellow('N/A (sudo required)')}       "
+                            reserved_cell = f"{console.yellow('N/A (sudo required)')}"
+                            has_sudo_na = True
                     else:
-                        inode_cell = f"{YELLOW}N/A (sudo required){NC}       "
-                        reserved_cell = f"{YELLOW}N/A (sudo required){NC}"
-                        has_sudo_na = True
+                        inode_cell = f"{'N/A (non-ext4)':<26}"
+                        reserved_cell = "N/A (non-ext4)"
+
+                    console.print(f"{dev_path:<14} {size_str:<8} {fs_label_str:<22} {mp_str:<24} {fstab_cell} {owner_perms_str:<20} {inode_cell} {reserved_cell}")
+
+            console.print("-" * 135)
+            console.print(f"Total Configured: {console.bold(str(len(configured_devices)))} drive(s) healthy and persistent.")
+            if has_sudo_na:
+                console.print(f"  {console.yellow('ℹ Note:')} Run with {console.bold('sudo')} to calculate ext4 inode table overhead and reserved space.")
+            console.print("")
+
+        # --------------------------------------------------------------------------
+        # SECTION 2: UNCONFIGURED / AVAILABLE STORAGE DEVICES (Always rendered)
+        # --------------------------------------------------------------------------
+        console.rule("=", 135)
+        console.print(f"{' ' * 44}{console.cyan(console.bold('UNCONFIGURED / AVAILABLE STORAGE DEVICES'))}")
+        console.rule("=", 135)
+
+        header_unc = f"{'DEVICE':<14} {'SIZE':<8} {'TYPE':<6} {'MODEL':<22} {'FS':<8} {'STATUS':<24} {'DETAILS'}"
+        console.print(console.bold(header_unc))
+        console.print("-" * 135)
+
+        if not unconfigured_devices:
+            console.print(f"  {console.green('[OK]')} No unconfigured or orphaned storage devices detected.")
+        else:
+            for item in unconfigured_devices:
+                dev = item.device
+                state = item.state
+                model = ""
+                if state.device and state.device.model:
+                    model = state.device.model
+                elif state.parent_device and state.parent_device.model:
+                    model = state.parent_device.model
+                elif dev.model:
+                    model = dev.model
+
+                model_str = (model or "Generic")[:20]
+                fs_str = (state.fstype or "-")[:7]
+
+                details = item.details
+                if state.label:
+                    details = f"Label: '{state.label}', {details}"
+
+                if item.status == "RAW_UNFORMATTED":
+                    colored_badge = console.yellow(item.status_badge)
+                elif item.status == "UNCONFIGURED_FS":
+                    colored_badge = console.cyan(item.status_badge)
                 else:
-                    inode_cell = f"{'N/A (non-ext4)':<26}"
-                    reserved_cell = "N/A (non-ext4)"
+                    colored_badge = console.yellow(item.status_badge)
 
-                print(f"{dev_path:<14} {size_str:<8} {fs_label_str:<22} {mp_str:<24} {fstab_cell} {owner_perms_str:<20} {inode_cell} {reserved_cell}", flush=True)
+                badge_pad = 33 if console.enabled else 24
+                console.print(f"{dev.path:<14} {dev.size:<8} {dev.type:<6} {model_str:<22} {fs_str:<8} {colored_badge:<{badge_pad}} {details}")
 
-        print("-" * 135, flush=True)
-        print(f"Total Configured: {BOLD}{len(configured_devices)}{NC} drive(s) healthy and persistent.", flush=True)
-        if has_sudo_na:
-            print(f"  {YELLOW}ℹ Note:{NC} Run with {BOLD}sudo{NC} to calculate ext4 inode table overhead and reserved space.", flush=True)
-        print("", flush=True)
+        console.print("-" * 135)
+        if unconfigured_devices:
+            first_dev = unconfigured_devices[0].device.path
+            console.print(f"Found {console.bold(str(len(unconfigured_devices)))} storage device(s) requiring setup.")
+            console.print(f"Example setup: {console.bold(f'sudo ./drive_setup.py -d {first_dev} -m /mnt/storage -l \"storage_pool\" --format')}")
+        console.rule("=", 135)
+        console.print("")
+        return 0
 
-    # --------------------------------------------------------------------------
-    # SECTION 2: UNCONFIGURED / AVAILABLE STORAGE DEVICES (Always rendered)
-    # --------------------------------------------------------------------------
-    print(f"{BOLD}{'=' * 135}{NC}", flush=True)
-    print(f"{' ' * 44}{CYAN}{BOLD}UNCONFIGURED / AVAILABLE STORAGE DEVICES{NC}", flush=True)
-    print(f"{BOLD}{'=' * 135}{NC}", flush=True)
+    @staticmethod
+    def render_json(report: ScanReport) -> int:
+        cfg_out = []
+        for dev, st in report.configured_devices:
+            cfg_out.append({
+                "device": dev.path,
+                "size": dev.size or (st.device.size if st.device else None),
+                "fstype": st.fstype,
+                "label": st.label,
+                "uuid": st.uuid,
+                "mountpoint": st.current_mounts[0] if st.current_mounts else None,
+                "mountpoints": st.current_mounts,
+                "in_fstab": st.in_fstab,
+                "fstab_mountpoint": st.fstab_entry.mountpoint if st.fstab_entry else None,
+                "owner": st.mountpoint_owner,
+                "perms": st.mountpoint_perms,
+                "total_inodes": st.total_inodes,
+                "free_inodes": st.free_inodes,
+                "used_inodes": st.used_inodes,
+                "inode_profile": st.detected_inode_profile,
+                "inode_table_overhead_bytes": st.inode_table_overhead_bytes,
+                "reserved_space_bytes": st.reserved_space_bytes,
+                "reserved_percent": st.reserved_percent,
+            })
 
-    header_unc = f"{'DEVICE':<14} {'SIZE':<8} {'TYPE':<6} {'MODEL':<22} {'FS':<8} {'STATUS':<24} {'DETAILS'}"
-    print(BOLD + header_unc + NC, flush=True)
-    print("-" * 135, flush=True)
-
-    if not unconfigured_devices:
-        print(f"  {GREEN}[OK] No unconfigured or orphaned storage devices detected.{NC}", flush=True)
-    else:
-        for dev, state, status_badge, details in unconfigured_devices:
+        unc_out = []
+        for item in report.unconfigured_devices:
+            dev = item.device
+            st = item.state
             model = ""
-            if state.device and state.device.model:
-                model = state.device.model
-            elif state.parent_device and state.parent_device.model:
-                model = state.parent_device.model
+            if st.device and st.device.model:
+                model = st.device.model
+            elif st.parent_device and st.parent_device.model:
+                model = st.parent_device.model
             elif dev.model:
                 model = dev.model
 
-            model_str = (model or "Generic")[:20]
-            fs_str = (state.fstype or "-")[:7]
+            unc_out.append({
+                "device": dev.path,
+                "size": dev.size,
+                "type": dev.type,
+                "model": model or None,
+                "fstype": st.fstype,
+                "label": st.label,
+                "uuid": st.uuid,
+                "status": item.status,
+                "details": f"Label: '{st.label}', {item.details}" if st.label else item.details,
+            })
 
-            if state.label:
-                details = f"Label: '{state.label}', {details}"
+        suggested_cmd = None
+        if unc_out:
+            first_dev = unc_out[0]["device"]
+            suggested_cmd = f"sudo ./drive_setup.py -d {first_dev} -m /mnt/storage -l \"storage_pool\" --format"
 
-            print(f"{dev.path:<14} {dev.size:<8} {dev.type:<6} {model_str:<22} {fs_str:<8} {status_badge:<33} {details}", flush=True)
-
-    print("-" * 135, flush=True)
-    if unconfigured_devices:
-        first_dev = unconfigured_devices[0][0].path
-        print(f"Found {BOLD}{len(unconfigured_devices)}{NC} storage device(s) requiring setup.", flush=True)
-        print(f"Example setup: {BOLD}sudo ./drive_setup.py -d {first_dev} -m /mnt/storage -l \"storage_pool\" --format{NC}", flush=True)
-    print(f"{BOLD}{'=' * 135}{NC}\n", flush=True)
-    return 0
+        payload = {
+            "status": "success",
+            "mode": "scan",
+            "unconfigured_only": report.unconfigured_only,
+            "configured_devices": [] if report.unconfigured_only else cfg_out,
+            "unconfigured_devices": unc_out,
+            "total_configured": len(cfg_out),
+            "total_unconfigured": len(unc_out),
+            "requires_action": len(unc_out) > 0,
+            "suggested_command": suggested_cmd,
+        }
+        print(json.dumps(payload, indent=2), flush=True)
+        return 0
 
 
 # ==============================================================================
@@ -936,7 +1358,10 @@ def step_format(
     inode_reserve_type: str = "largefile",
     reserved_percent: int = 1,
     assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
 ) -> None:
+    con = console or Console(stream=sys.stdout)
     if fstype == "ext4":
         cmd = ["mkfs.ext4", "-F", "-L", label]
         if inode_reserve_type in ("largefile", "largefile4"):
@@ -945,61 +1370,78 @@ def step_format(
     else:
         cmd = ["mkfs", "-t", fstype, "-L", label, device]
 
+    warning_text = con.red(con.bold(f"WARNING: THIS IS DESTRUCTIVE! All existing data on '{device}' will be erased."))
     exp = (
         f"This will format block device '{device}' as an {fstype} filesystem with volume label '{label}'\n"
         f"                 (Inode Profile: {inode_reserve_type}, Reserved Root: {reserved_percent}%).\n"
-        f"                 {RED}{BOLD}WARNING: THIS IS DESTRUCTIVE! All existing data on '{device}' will be erased.{NC}"
+        f"                 {warning_text}"
     )
     act = f"Format {device} as {fstype} (Label: {label}, Profile: {inode_reserve_type}, Reserve: {reserved_percent}%)"
 
-    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes):
+    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="FORMAT"):
         # Ensure device is unmounted first
         try:
             with open("/proc/mounts", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith(f"{device} "):
                         logger.warning("Device is currently mounted. Unmounting before formatting...")
-                        run_cmd(["umount", device], check=True)
+                        run_cmd(["umount", device], check=True, console=con)
                         break
         except Exception:
             pass
 
         logger.info(f"Formatting {device} as {fstype} with label '{label}' (Profile: {inode_reserve_type}, Reserve: {reserved_percent}%)...")
         # Stream stdout and stderr directly to console live
-        res = run_cmd(cmd, capture_output=False)
+        res = run_cmd(cmd, capture_output=False, console=con)
         if res.returncode != 0:
             logger.error(f"mkfs failed with exit code {res.returncode}")
             sys.exit(res.returncode)
 
-        print(f"{GREEN}[SUCCESS] Successfully formatted {device} as {fstype} with label '{label}'.{NC}", flush=True)
+        if not json_mode:
+            con.print(f"{con.green('[SUCCESS]')} Successfully formatted {device} as {fstype} with label '{label}'.")
 
 
-def step_tune_reserve_block(device: str, reserved_percent: int = 1, assume_yes: bool = False) -> None:
+def step_tune_reserve_block(
+    device: str,
+    reserved_percent: int = 1,
+    assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
+) -> None:
+    con = console or Console(stream=sys.stdout)
     cmd = ["tune2fs", "-m", str(reserved_percent), device]
     exp = f"This will adjust the filesystem reserved root blocks on '{device}' to {reserved_percent}% via tune2fs."
     act = f"Tune reserved block percentage on {device} to {reserved_percent}%"
 
-    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes):
+    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="TUNE_RESERVED"):
         logger.info(f"Tuning reserved blocks on {device} to {reserved_percent}% via tune2fs...")
-        res = run_cmd(cmd)
+        res = run_cmd(cmd, console=con)
         if res.returncode != 0:
             logger.error(f"tune2fs failed with exit code {res.returncode}")
             sys.exit(res.returncode)
 
-        print(f"{GREEN}[SUCCESS] Reserved blocks percentage successfully updated to {reserved_percent}%.{NC}", flush=True)
+        if not json_mode:
+            con.print(f"{con.green('[SUCCESS]')} Reserved blocks percentage successfully updated to {reserved_percent}%.")
 
 
-def step_mount(device: str, mountpoint: str, assume_yes: bool = False) -> None:
+def step_mount(
+    device: str,
+    mountpoint: str,
+    assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
+) -> None:
+    con = console or Console(stream=sys.stdout)
     cmd = ["mount", device, mountpoint]
     exp = f"This will verify/create directory '{mountpoint}' and mount device '{device}' to it."
     act = f"Mount {device} to {mountpoint}"
 
-    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes):
+    if confirm(exp, act, cmd=cmd, assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="MOUNT"):
         mp_path = Path(mountpoint)
         mp_path.mkdir(parents=True, exist_ok=True)
 
         # Check if already mounted
-        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint])
+        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint], console=con)
         if findmnt.returncode == 0 and findmnt.stdout.strip():
             src = findmnt.stdout.strip()
             if src == device or os.path.realpath(src) == os.path.realpath(device):
@@ -1009,16 +1451,25 @@ def step_mount(device: str, mountpoint: str, assume_yes: bool = False) -> None:
                 logger.warning(f"Mount point {mountpoint} is occupied by {src}. Mounting over it...")
 
         logger.info(f"Mounting {device} to {mountpoint}...")
-        res = run_cmd(cmd, capture_output=False)
+        res = run_cmd(cmd, capture_output=False, console=con)
         if res.returncode != 0:
             logger.error(f"mount failed with exit code {res.returncode}")
             sys.exit(res.returncode)
 
-        print(f"{GREEN}[SUCCESS] Device successfully mounted to {mountpoint}.{NC}", flush=True)
+        if not json_mode:
+            con.print(f"{con.green('[SUCCESS]')} Device successfully mounted to {mountpoint}.")
 
 
-def step_fstab(device: str, mountpoint: str, fstype: str = "ext4", assume_yes: bool = False) -> None:
-    blkid = run_cmd(["blkid", "-s", "UUID", "-o", "value", device])
+def step_fstab(
+    device: str,
+    mountpoint: str,
+    fstype: str = "ext4",
+    assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
+) -> None:
+    con = console or Console(stream=sys.stdout)
+    blkid = run_cmd(["blkid", "-s", "UUID", "-o", "value", device], console=con)
     uuid = blkid.stdout.strip() if blkid.returncode == 0 else ""
     uuid_str = uuid if uuid else "<DEVICE_UUID>"
     fstab_line = f"UUID={uuid_str}  {mountpoint}  {fstype}  defaults,nofail  0  2"
@@ -1029,10 +1480,10 @@ def step_fstab(device: str, mountpoint: str, fstype: str = "ext4", assume_yes: b
     )
     act = f"Configure persistent mount in /etc/fstab"
 
-    if confirm(exp, act, cmd=f"echo '{fstab_line}' >> /etc/fstab", assume_yes=assume_yes):
+    if confirm(exp, act, cmd=f"echo '{fstab_line}' >> /etc/fstab", assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="FSTAB"):
         logger.info(f"Extracting device UUID via blkid for {device}...")
         if not uuid:
-            blkid = run_cmd(["blkid", "-s", "UUID", "-o", "value", device], check=True)
+            blkid = run_cmd(["blkid", "-s", "UUID", "-o", "value", device], check=True, console=con)
             uuid = blkid.stdout.strip()
             if not uuid:
                 logger.error(f"Could not extract UUID for {device}. Is it formatted?")
@@ -1047,9 +1498,18 @@ def step_fstab(device: str, mountpoint: str, fstype: str = "ext4", assume_yes: b
 
         logger.info("Appending entry to /etc/fstab with atomic backup...")
         FstabManager.append_entry(uuid=uuid, mountpoint=mountpoint, fstype=fstype, options="defaults,nofail", freq=0, passno=2)
+        if not json_mode:
+            con.print(f"{con.green('[SUCCESS]')} /etc/fstab successfully configured with UUID={uuid}.")
 
 
-def step_permissions(mountpoint: str, username: str, assume_yes: bool = False) -> None:
+def step_permissions(
+    mountpoint: str,
+    username: str,
+    assume_yes: bool = False,
+    console: Optional[Console] = None,
+    json_mode: bool = False,
+) -> None:
+    con = console or Console(stream=sys.stdout)
     try:
         pw = pwd.getpwnam(username)
         group_name = grp.getgrgid(pw.pw_gid).gr_name
@@ -1060,8 +1520,8 @@ def step_permissions(mountpoint: str, username: str, assume_yes: bool = False) -
     exp = f"This will set directory ownership of '{mountpoint}' to user '{username}' with standard 755 permissions."
     act = f"Set ownership and permissions on {mountpoint} for {username}"
 
-    if confirm(exp, act, cmd=perm_cmd, assume_yes=assume_yes):
-        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint])
+    if confirm(exp, act, cmd=perm_cmd, assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="PERMS"):
+        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint], console=con)
         if findmnt.returncode != 0 or not findmnt.stdout.strip():
             logger.error(f"Mount point '{mountpoint}' is not currently active.")
             logger.error("Please mount the drive first before applying permissions.")
@@ -1078,18 +1538,94 @@ def step_permissions(mountpoint: str, username: str, assume_yes: bool = False) -
         logger.info(f"Setting ownership on {mountpoint} to {username} ({uid}:{gid}) and permissions 755...")
         os.chown(mountpoint, uid, gid)
         os.chmod(mountpoint, 0o755)
-        print(f"{GREEN}[SUCCESS] Mount point ownership and permissions updated successfully (755).{NC}", flush=True)
+        if not json_mode:
+            con.print(f"{con.green('[SUCCESS]')} Mount point ownership and permissions updated successfully (755).")
+
+
+# ==============================================================================
+# SETUP ACTION PLAN PRESENTER
+# ==============================================================================
+class SetupPresenter:
+    """Strategy for rendering storage provisioning action plans in JSON or human-readable format."""
+
+    @staticmethod
+    def render_action_plan(plan: ActionPlan, console: Console) -> None:
+        console.print(f"\n{console.bold('=' * 70)}")
+        console.print(f"                {console.green(console.bold('STORAGE PROVISIONING ACTION PLAN'))}")
+        console.print(f"{console.bold('=' * 70)}")
+        console.print(f"Target Device:     {console.bold(plan.device)} ({plan.model}, {plan.size})")
+        console.print(f"Target Mountpoint: {console.bold(plan.target_mountpoint or '[Not Needed / None]')}")
+        console.print(f"Target Owner:      {console.bold(plan.target_user)}")
+        console.print(f"Filesystem Type:   {console.bold(plan.fstype)}")
+        console.print(f"Filesystem Label:  {console.bold(plan.label or '[Not Needed / None]')}")
+        if plan.fstype == "ext4":
+            console.print(f"Inode Profile:     {console.bold(plan.inode_reserve_type)}")
+            console.print(f"Reserved Root:     {console.bold(str(plan.reserved_percent) + '%')}")
+        console.print(f"Force Mode:        {console.bold(str(plan.force))}")
+        console.print("-" * 70)
+        console.print(f"{console.bold('PRE-FLIGHT ACTION EVALUATION:')}")
+
+        for d in plan.decisions:
+            if d.action == "EXECUTE":
+                badge = console.green("[EXECUTE]")
+            elif d.action == "FORCE_OVERRIDE":
+                badge = console.red("[OVERRIDE]")
+            else:
+                badge = console.yellow("[SKIP]")
+            console.print(f"  [{d.step_id}] {d.name:<13} {badge} {d.reason}")
+            if d.sub_text:
+                console.print(f"                    {d.sub_text}")
+
+        console.print("-" * 70)
+        console.print(f"Summary: {console.bold(str(plan.execute_count))} action(s) to execute | {console.bold(str(plan.skip_count))} action(s) skipped (already configured).")
+        if plan.skip_count > 0 and not plan.force:
+            console.print("Pass '--force' if you wish to override skipped actions.")
+        console.print(f"{console.bold('=' * 70)}\n")
+
+    @staticmethod
+    def render_json(plan: ActionPlan) -> None:
+        payload = {
+            "status": "success",
+            "mode": "setup_plan",
+            "device": plan.device,
+            "model": plan.model,
+            "size": plan.size,
+            "mountpoint": plan.target_mountpoint,
+            "owner": plan.target_user,
+            "fstype": plan.fstype,
+            "label": plan.label,
+            "inode_profile": plan.inode_reserve_type if plan.fstype == "ext4" else None,
+            "reserved_percent": plan.reserved_percent if plan.fstype == "ext4" else None,
+            "force": plan.force,
+            "execute_count": plan.execute_count,
+            "skip_count": plan.skip_count,
+            "decisions": [
+                {
+                    "step_id": d.step_id,
+                    "name": d.name,
+                    "action": d.action,
+                    "reason": d.reason,
+                    "sub_text": d.sub_text,
+                }
+                for d in plan.decisions
+            ],
+        }
+        print(json.dumps(payload, indent=2), flush=True)
 
 
 # ==============================================================================
 # MAIN SETUP WORKFLOW WITH ACTION PLAN MATRIX
 # ==============================================================================
-def run_setup(args: argparse.Namespace) -> None:
+def run_setup(args: argparse.Namespace, console: Console) -> None:
+    json_mode = args.json
     if os.geteuid() != 0:
-        logger.error("Storage setup actions require administrative privileges.")
-        print(f"\n{RED}{BOLD}[PERMISSION ERROR]{NC} Storage setup stages require administrative privileges (root).", file=sys.stderr)
-        print(f"Please re-run this command with {BOLD}sudo{NC}:", file=sys.stderr)
-        print(f"  {BOLD}sudo {' '.join(sys.argv)}{NC}\n", file=sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_PERMISSION_DENIED",
+            message="Storage setup stages require administrative privileges (root).",
+            remediation=f"sudo {' '.join(sys.argv)}",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     input_device = args.device
@@ -1139,7 +1675,13 @@ def run_setup(args: argparse.Namespace) -> None:
     state = DeviceInspector.inspect(input_device, mountpoint, username)
 
     if not state.is_block_device:
-        logger.error(f"Target device '{input_device}' is not a valid block device on this system.")
+        ErrorPresenter.render_error(
+            error_code="E_INVALID_DEVICE",
+            message=f"Target device '{input_device}' is not a valid block device on this system.",
+            remediation="Check available block devices using './drive_setup.py --scan --json'.",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     device = state.device_path
@@ -1147,12 +1689,15 @@ def run_setup(args: argparse.Namespace) -> None:
     # Safeguard against accidental whole-disk format when partitions exist
     if do_format and state.device and state.device.type == "disk" and len(state.child_partitions) > 0:
         if not force:
-            logger.error(f"Target '{input_device}' contains existing partition(s):")
-            for p in state.child_partitions:
-                print(f"  → {p.path} ({p.size}, {p.fstype or 'no fs'})", file=sys.stderr)
-            logger.error("Formatting the whole disk will destroy the partition table.")
-            logger.error(f"To format a partition instead, pass '-d {state.child_partitions[0].path}'.")
-            logger.error("To intentionally wipe the entire disk and all its partitions, pass '--force'.")
+            parts = [p.path for p in state.child_partitions]
+            ErrorPresenter.render_error(
+                error_code="E_EXISTING_PARTITIONS",
+                message=f"Target '{input_device}' contains existing partition(s): {', '.join(parts)}. Formatting the whole disk will destroy the partition table.",
+                remediation=f"To format a partition, pass '-d {state.child_partitions[0].path}'. To wipe the entire disk, pass '--force'.",
+                console=console,
+                json_mode=json_mode,
+                extra={"partitions": parts},
+            )
             sys.exit(1)
 
     # Safeguard: if device already contains a filesystem that doesn't match desired state, require --force
@@ -1164,51 +1709,70 @@ def run_setup(args: argparse.Namespace) -> None:
             and (fstype != "ext4" or detected_profile == inode_reserve_type)
         )
         if not is_already_target and not force:
-            logger.error(f"Target device '{input_device}' already contains an active filesystem:")
             dev_profile_str = f" | Inode Profile: {detected_profile}" if state.fstype == "ext4" else ""
             target_profile_str = f" | Inode Profile: {inode_reserve_type}" if fstype == "ext4" else ""
-            print(f"        Detected: Filesystem: {state.fstype} | UUID: {state.uuid or 'none'} | Label: {state.label or 'none'}{dev_profile_str}", file=sys.stderr)
-            print(f"        Desired:  Filesystem: {fstype} | Label: {label}{target_profile_str}", file=sys.stderr)
-            if state.fstype == "ext4" and fstype == "ext4" and state.label == label and detected_profile != inode_reserve_type:
-                logger.error(f"Inode profile mismatch detected ('{detected_profile}' on disk vs '{inode_reserve_type}' desired).")
-            print(f"\n{RED}{BOLD}[PROTECTION] An active filesystem was detected on '{input_device}'. Reformatting will permanently destroy all existing contents.{NC}", file=sys.stderr)
-            logger.error("If you intend to overwrite this drive with the new configuration, explicitly pass '--force' ('-f').")
             cmd_suggestion = f"sudo ./drive_setup.py -d {input_device} -m {mountpoint} -l \"{label}\" -t {fstype} -irt {inode_reserve_type} -r {reserved_percent} -fmt -f"
-            print(f"\nRe-run with -f: {BOLD}{cmd_suggestion}{NC}\n", file=sys.stderr)
+            ErrorPresenter.render_error(
+                error_code="E_ACTIVE_FILESYSTEM",
+                message=f"Target device '{input_device}' already contains an active filesystem ({state.fstype}, Label: {state.label or 'none'}{dev_profile_str}). Reformatting will permanently destroy all existing contents.",
+                remediation=f"If you intend to overwrite this drive, explicitly pass '--force' ('-f'):\n        {cmd_suggestion}",
+                console=console,
+                json_mode=json_mode,
+            )
             sys.exit(1)
 
     # 3. Strict Backward Prerequisite Validation
     if do_mount and not do_format and not state.is_formatted:
-        logger.error("Prerequisite check failed for '--mount':")
-        print(f"        Device '{device}' has no recognizable filesystem (unformatted).", file=sys.stderr)
-        print(f"        Cannot mount an unformatted drive.", file=sys.stderr)
-        print(f"        To format and provision this drive from scratch, run:", file=sys.stderr)
-        print(f"        sudo ./drive_setup.py -d {device} -m {mountpoint} -l <label> -t {fstype} --format", file=sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_UNFORMATTED_DRIVE",
+            message=f"Prerequisite check failed for '--mount': Device '{device}' has no recognizable filesystem (unformatted).",
+            remediation=f"sudo ./drive_setup.py -d {device} -m {mountpoint} -l <label> -t {fstype} --format",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     if do_fstab and not do_format and not state.is_formatted:
-        logger.error("Prerequisite check failed for '--fstab':")
-        print(f"        Device '{device}' is unformatted and has no UUID.", file=sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_UNFORMATTED_DRIVE",
+            message=f"Prerequisite check failed for '--fstab': Device '{device}' is unformatted and has no UUID.",
+            remediation=f"sudo ./drive_setup.py -d {device} -m {mountpoint} -l <label> -t {fstype} --format",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     if do_perms and not do_mount and not state.mountpoint_is_mounted:
-        logger.error("Prerequisite check failed for '--perms':")
-        print(f"        Target mount point '{mountpoint}' is not actively mounted.", file=sys.stderr)
-        print(f"        Setting permissions on an unmounted directory only affects the host root disk.", file=sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_MOUNTPOINT_NOT_MOUNTED",
+            message=f"Prerequisite check failed for '--perms': Target mount point '{mountpoint}' is not actively mounted.",
+            remediation="Mount the drive first before applying permissions.",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     if do_tune and not do_format:
         if not state.is_formatted or state.fstype != "ext4":
-            logger.error("Prerequisite check failed for '--tune-reserve-block':")
-            print(f"        Device '{device}' is not formatted as an ext4 filesystem (current: {state.fstype or 'unformatted'}).", file=sys.stderr)
-            print("        tune2fs reserved block tuning is only supported on ext4 filesystems.", file=sys.stderr)
+            ErrorPresenter.render_error(
+                error_code="E_NOT_EXT4",
+                message=f"Prerequisite check failed for '--tune-reserve-block': Device '{device}' is not ext4 (current: {state.fstype or 'unformatted'}).",
+                remediation="tune2fs reserved block tuning is only supported on ext4 filesystems.",
+                console=console,
+                json_mode=json_mode,
+            )
             sys.exit(1)
 
     # Validate label requirement when formatting is part of the plan
     if do_format and not label:
         if not state.is_formatted or force:
-            logger.error("Filesystem label is required when formatting.")
-            print(f"        Please specify a label using '-l <label>' (e.g. -l \"ArchiveStorage\").", file=sys.stderr)
+            ErrorPresenter.render_error(
+                error_code="E_MISSING_LABEL",
+                message="Filesystem label is required when formatting.",
+                remediation="Please specify a label using '-l <label>' (e.g. -l \"ArchiveStorage\").",
+                console=console,
+                json_mode=json_mode,
+            )
             sys.exit(1)
 
     # 4. Build Pre-Flight Action Plan Matrix
@@ -1231,7 +1795,6 @@ def run_setup(args: argparse.Namespace) -> None:
             else:
                 dec = StepDecision(len(decisions) + 1, "FORMAT", "SKIP", f"Device is already {fstype} '{label}' with matching {detected_profile} inodes (pass -f to reformat)")
         elif state.is_formatted:
-            # Reached here only when force is True (due to safety check above)
             format_will_execute = True
             mismatch_items = []
             if state.fstype != fstype:
@@ -1247,11 +1810,11 @@ def run_setup(args: argparse.Namespace) -> None:
             dec = StepDecision(len(decisions) + 1, "FORMAT", "EXECUTE", f"Format raw device as {fstype} with label '{label}' ({inode_reserve_type} inodes, -m {reserved_percent}%)")
 
         if format_will_execute and fstype == "ext4":
-            dec.sub_text = f"↳ TUNE_RESERVED: {CYAN}[INCLUDED]{NC} {reserved_percent}% root reserved space set natively via mkfs.ext4 (-m {reserved_percent})"
+            dec.sub_text = f"↳ TUNE_RESERVED: {console.cyan('[INCLUDED]')} {reserved_percent}% root reserved space set natively via mkfs.ext4 (-m {reserved_percent})"
 
         decisions.append(dec)
 
-    # Step: Tune Reserved Blocks (only evaluated as a separate step when format is NOT executing)
+    # Step: Tune Reserved Blocks
     if do_tune and not format_will_execute:
         if fstype != "ext4":
             decisions.append(StepDecision(len(decisions) + 1, "TUNE_RESERVED", "SKIP", f"Not applicable for {fstype} filesystem"))
@@ -1297,7 +1860,6 @@ def run_setup(args: argparse.Namespace) -> None:
         else:
             decisions.append(StepDecision(len(decisions) + 1, "PERMS", "EXECUTE", f"Set ownership to {username} and permissions to 755"))
 
-    # 5. Display Upfront Action Plan Matrix
     dev_model = "Generic"
     if state.device and state.device.model:
         dev_model = state.device.model
@@ -1305,67 +1867,70 @@ def run_setup(args: argparse.Namespace) -> None:
         dev_model = state.parent_device.model
     dev_size = state.device.size if state.device and state.device.size else "Unknown"
 
-    print(f"\n{BOLD}======================================================================{NC}", flush=True)
-    print(f"                {GREEN}{BOLD}STORAGE PROVISIONING ACTION PLAN{NC}", flush=True)
-    print(f"{BOLD}======================================================================{NC}", flush=True)
-    print(f"Target Device:     {BOLD}{device}{NC} ({dev_model}, {dev_size})", flush=True)
-    print(f"Target Mountpoint: {BOLD}{mountpoint or '[Not Needed / None]'}{NC}", flush=True)
-    print(f"Target Owner:      {BOLD}{username}{NC}", flush=True)
-    print(f"Filesystem Type:   {BOLD}{fstype}{NC}", flush=True)
-    print(f"Filesystem Label:  {BOLD}{label or '[Not Needed / None]'}{NC}", flush=True)
-    if fstype == "ext4":
-        print(f"Inode Profile:     {BOLD}{inode_reserve_type}{NC}", flush=True)
-        print(f"Reserved Root:     {BOLD}{reserved_percent}%{NC}", flush=True)
-    print(f"Force Mode:        {BOLD}{force}{NC}", flush=True)
-    print("----------------------------------------------------------------------", flush=True)
-    print(f"{BOLD}PRE-FLIGHT ACTION EVALUATION:{NC}", flush=True)
+    execute_count = sum(1 for d in decisions if d.action in ("EXECUTE", "FORCE_OVERRIDE"))
+    skip_count = sum(1 for d in decisions if d.action == "SKIP")
 
-    execute_count = 0
-    skip_count = 0
+    plan = ActionPlan(
+        device=device,
+        target_mountpoint=mountpoint,
+        target_user=username,
+        fstype=fstype,
+        label=label,
+        inode_reserve_type=inode_reserve_type,
+        reserved_percent=reserved_percent,
+        force=force,
+        decisions=decisions,
+        model=dev_model,
+        size=dev_size,
+        execute_count=execute_count,
+        skip_count=skip_count,
+    )
 
-    for d in decisions:
-        if d.action == "EXECUTE":
-            badge = f"{GREEN}[EXECUTE]{NC}"
-            execute_count += 1
-        elif d.action == "FORCE_OVERRIDE":
-            badge = f"{RED}[OVERRIDE]{NC}"
-            execute_count += 1
-        else:
-            badge = f"{YELLOW}[SKIP]{NC}"
-            skip_count += 1
-        print(f"  [{d.step_id}] {d.name:<13} {badge} {d.reason}", flush=True)
-        if d.sub_text:
-            print(f"                    {d.sub_text}", flush=True)
-
-    print("----------------------------------------------------------------------", flush=True)
-    print(f"Summary: {BOLD}{execute_count}{NC} action(s) to execute | {BOLD}{skip_count}{NC} action(s) skipped (already configured).", flush=True)
-    if skip_count > 0 and not force:
-        print("Pass '--force' if you wish to override skipped actions.", flush=True)
-    print(f"{BOLD}======================================================================{NC}\n", flush=True)
+    if not json_mode:
+        SetupPresenter.render_action_plan(plan, console)
 
     if execute_count == 0:
-        print(f"{GREEN}{BOLD}✓ All requested operations are already complete. Nothing to do!{NC}\n", flush=True)
+        if json_mode:
+            print(json.dumps({
+                "status": "success",
+                "mode": "setup",
+                "message": "All requested operations are already complete. Nothing to do!",
+                "device": device,
+                "mountpoint": mountpoint,
+                "actions_executed": 0,
+            }, indent=2), flush=True)
+        else:
+            console.print(f"{console.green(console.bold('✓ All requested operations are already complete. Nothing to do!'))}\n")
         return
 
     # 6. Execute Scheduled Steps
     for d in decisions:
         if d.action in ("EXECUTE", "FORCE_OVERRIDE"):
             if d.name == "FORMAT":
-                step_format(device, label, fstype, inode_reserve_type, reserved_percent, assume_yes)
+                step_format(device, label, fstype, inode_reserve_type, reserved_percent, assume_yes, console=console, json_mode=json_mode)
             elif d.name == "TUNE_RESERVED":
-                step_tune_reserve_block(device, reserved_percent, assume_yes)
+                step_tune_reserve_block(device, reserved_percent, assume_yes, console=console, json_mode=json_mode)
             elif d.name == "MOUNT":
-                step_mount(device, mountpoint, assume_yes)
+                step_mount(device, mountpoint, assume_yes, console=console, json_mode=json_mode)
             elif d.name == "FSTAB":
-                step_fstab(device, mountpoint, fstype, assume_yes)
+                step_fstab(device, mountpoint, fstype, assume_yes, console=console, json_mode=json_mode)
             elif d.name == "PERMS":
-                step_permissions(mountpoint, username, assume_yes)
+                step_permissions(mountpoint, username, assume_yes, console=console, json_mode=json_mode)
 
-    print(f"\n{GREEN}{BOLD}✓ Script execution completed successfully.{NC}", flush=True)
-    if mountpoint:
-        print(f"Drive '{device}' is fully configured and ready at '{mountpoint}'.\n", flush=True)
+    if json_mode:
+        print(json.dumps({
+            "status": "success",
+            "mode": "setup",
+            "device": device,
+            "mountpoint": mountpoint,
+            "actions_executed": execute_count,
+        }, indent=2), flush=True)
     else:
-        print(f"Drive '{device}' operations completed successfully.\n", flush=True)
+        console.print(f"\n{console.green(console.bold('✓ Script execution completed successfully.'))}")
+        if mountpoint:
+            console.print(f"Drive '{device}' is fully configured and ready at '{mountpoint}'.\n")
+        else:
+            console.print(f"Drive '{device}' operations completed successfully.\n")
 
 
 # ==============================================================================
@@ -1392,11 +1957,13 @@ def create_parser() -> argparse.ArgumentParser:
     setup_group.add_argument("-f", "--force", action="store_true", help="Force operations (override data protection and remount)")
     setup_group.add_argument("-v", "--verbose", action="store_true", default=True, help="Enable verbose debug logging (default: True)")
     setup_group.add_argument("-q", "--quiet", action="store_true", help="Quiet mode: suppress debug command logs and execution output")
+    setup_group.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="Color output mode (auto: detected via TTY/NO_COLOR, always, never)")
 
     mode_group = parser.add_argument_group("Audit & Discovery Modes")
     mode_group.add_argument("-V", "--verify", action="store_true", help="Inspect and verify the setup status of a drive without modifying anything")
     mode_group.add_argument("-s", "--scan", action="store_true", help="Scan system storage devices (displays configured and unconfigured)")
     mode_group.add_argument("-uo", "--unconfigured-only", action="store_true", help="When scanning, only display unconfigured / available storage devices (skips configured table)")
+    mode_group.add_argument("--json", action="store_true", help="Output results as structured JSON (for AI agents and automation)")
 
     steps_group = parser.add_argument_group("Setup Stages (Cascading Lifecycle)")
     steps_group.add_argument("-fmt", "--format", action="store_true", help="Stage 1: Format drive (with inode profile & reserved blocks) and cascade through all stages")
@@ -1432,46 +1999,109 @@ def main() -> None:
     parser = create_parser()
     args = parser.parse_args()
 
-    if args.quiet:
-        setup_logging(verbose=False, quiet=True)
+    json_mode = args.json
+    if json_mode:
+        console = Console(color_mode="never", stream=sys.stderr)
+        setup_logging(console=console, verbose=False, quiet=True)
     else:
-        setup_logging(verbose=True, quiet=False)
+        console = Console(color_mode=args.color, stream=sys.stdout)
+        if args.quiet:
+            setup_logging(console=console, verbose=False, quiet=True)
+        else:
+            setup_logging(console=console, verbose=True, quiet=False)
 
     # Mode 1: Scan
     if args.scan or args.unconfigured_only:
-        sys.exit(do_scan(unconfigured_only=args.unconfigured_only))
+        try:
+            report = do_scan(unconfigured_only=args.unconfigured_only)
+        except StorageSetupError as e:
+            ErrorPresenter.render_error(
+                error_code=e.error_code,
+                message=e.message,
+                remediation=e.remediation,
+                console=console,
+                json_mode=json_mode,
+                extra=e.extra,
+            )
+            sys.exit(1)
+
+        if json_mode:
+            sys.exit(ScanPresenter.render_json(report))
+        else:
+            sys.exit(ScanPresenter.render_table(report, console))
 
     # Mode 2: Verify
     if args.verify:
         if not args.device:
-            logger.error("Target device is required for --verify mode.")
-            print("        Specify device using '-d <device>' (e.g. -d /dev/sdb).\n", file=sys.stderr)
-            parser.print_help(sys.stderr)
+            ErrorPresenter.render_error(
+                error_code="E_MISSING_DEVICE",
+                message="Target device is required for --verify mode.",
+                remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
+                console=console,
+                json_mode=json_mode,
+            )
+            if not json_mode:
+                parser.print_help(sys.stderr)
             sys.exit(1)
-        sys.exit(do_verify(args.device, args.mountpoint, args.user))
+
+        try:
+            report = do_verify(args.device, args.mountpoint, args.user)
+        except StorageSetupError as e:
+            ErrorPresenter.render_error(
+                error_code=e.error_code,
+                message=e.message,
+                remediation=e.remediation,
+                console=console,
+                json_mode=json_mode,
+                extra=e.extra,
+            )
+            sys.exit(1)
+
+        if json_mode:
+            sys.exit(VerifyPresenter.render_json(report))
+        else:
+            sys.exit(VerifyPresenter.render_table(report, console))
 
     # Mode 3: Setup Actions
     has_step = any([args.format, args.mount, args.fstab, args.perms, args.tune_reserve_block, args.all])
     if not has_step:
-        logger.error("No setup stage specified.")
-        print("        Specify a starting stage (-fmt, -mnt, -fst, -p, -trb) or use '-a / --all'.\n", file=sys.stderr)
-        parser.print_help(sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_STAGE",
+            message="No setup stage specified.",
+            remediation="Specify a starting stage (-fmt, -mnt, -fst, -p, -trb) or use '-a / --all'.",
+            console=console,
+            json_mode=json_mode,
+        )
+        if not json_mode:
+            parser.print_help(sys.stderr)
         sys.exit(1)
 
     if not args.device:
-        logger.error("Target device is required for setup.")
-        print("        Specify device using '-d <device>' (e.g. -d /dev/sdb).\n", file=sys.stderr)
-        parser.print_help(sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_DEVICE",
+            message="Target device is required for setup.",
+            remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
+            console=console,
+            json_mode=json_mode,
+        )
+        if not json_mode:
+            parser.print_help(sys.stderr)
         sys.exit(1)
 
     only_tuning = args.tune_reserve_block and not any([args.format, args.mount, args.fstab, args.perms, args.all])
     if not args.mountpoint and not only_tuning:
-        logger.error("Target mount point directory is required for setup.")
-        print("        Specify mount point using '-m <path>' (e.g. -m /mnt/storage).\n", file=sys.stderr)
-        parser.print_help(sys.stderr)
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_MOUNTPOINT",
+            message="Target mount point directory is required for setup.",
+            remediation="Specify mount point using '-m <path>' (e.g. -m /mnt/storage).",
+            console=console,
+            json_mode=json_mode,
+        )
+        if not json_mode:
+            parser.print_help(sys.stderr)
         sys.exit(1)
 
-    run_setup(args)
+    run_setup(args, console=console)
 
 
 if __name__ == "__main__":

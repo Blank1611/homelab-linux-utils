@@ -179,6 +179,8 @@ sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 | `-f` | `--force` | Force operations (override partition protection, remount) | `False` |
 | `-v` | `--verbose` | Enable verbose/debug subprocess logging | `True` |
 | `-q` | `--quiet` | Quiet mode: suppress debug command logs and subprocess output | `False` |
+| `--color` | | Color mode: `auto` (default, TTY/NO_COLOR detected), `always`, `never` | `auto` |
+| | `--json` | Output pure structured JSON payload on stdout (for AI agents & scripts) | `False` |
 
 ### Modes & Stages
 
@@ -196,6 +198,55 @@ sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 
 ---
 
+## 🤖 AI Agent & Automation Integration
+
+`drive_setup.py` is purpose-built for both terminal-native AI agents (e.g. Antigravity, Claude Code, Cursor, terminal subagents) and traditional CI/CD / headless automation:
+
+### 1. Pure Structured JSON Mode (`--json`)
+When passing `--json`, the tool guarantees that `sys.stdout` contains **100% pure, parseable JSON** with standard 2-space indentation.
+- **Human logs & subprocess traces are directed to `sys.stderr`**, keeping the JSON stream uncorrupted.
+- Standard JSON schema includes `"status"`, `"mode"`, detailed component states, and actionable suggestions.
+- On errors, standard structured error envelopes are emitted with remediation:
+  ```json
+  {
+    "status": "error",
+    "error_code": "E_INVALID_DEVICE",
+    "message": "Target device '/dev/nonexistent' is not a valid block device on this system.",
+    "remediation": "Check available block devices using './drive_setup.py --scan --json'."
+  }
+  ```
+
+### 2. Automatic TTY & NO_COLOR Standard Compliance
+- When running in an interactive terminal, rich ANSI colors and badges highlight status.
+- When output is redirected or piped (e.g. `./drive_setup.py -s | cat` or background subshells), the tool automatically detects `sys.stdout.isatty() == False` and strips all ANSI escape codes.
+- Adheres to the [`NO_COLOR`](https://no-color.org) standard: setting `NO_COLOR=1` disables color codes immediately.
+- Explicit override is available via `--color=always` or `--color=never`.
+
+### 3. Fail-Fast Non-Interactive Guardrail
+- If an agent or automated pipeline runs a modifying stage without passing `-y` / `--yes`, the tool immediately aborts without hanging on stdin.
+- Returns standard POSIX usage exit code **`2`** with clear instructions to pass `-y`.
+
+### 4. Exit Code Contract
+| Exit Code | Meaning | Context |
+| :--- | :--- | :--- |
+| `0` | **Success** | Scan completed, setup successful, or audit verified 100% healthy. |
+| `1` | **Warning / Error** | Audit detected missing steps/unhealthy state, missing arguments, or command execution failure. |
+| `2` | **Usage / Non-Interactive** | Operation required confirmation but executed in headless/agent shell without `-y` / `--yes`. |
+
+### Agent Examples
+```bash
+# Agent discovers unconfigured storage and parses via jq
+drive=$(./drive_setup.py --scan --json | jq -r '.unconfigured_devices[0].device // empty')
+
+# Agent runs audit on discovered drive
+./drive_setup.py -V -d "$drive" -m /mnt/storage --json
+
+# Agent safely executes full provisioning non-interactively
+sudo ./drive_setup.py -d "$drive" -m /mnt/storage -l "storage_pool" -fmt -y --json
+```
+
+---
+
 ## 🔒 Safety Safeguards
 
 1. **Pre-Flight Action Evaluation:** Inspects current state and presents an upfront Action Plan Matrix before any action is executed.
@@ -209,3 +260,4 @@ sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 ## 📄 License
 
 Open-source under the [MIT License](LICENSE) (or your preferred homelab license).
+
