@@ -182,6 +182,9 @@ sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
 | `-r` | `--reserved-percent` | Reserved root blocks percentage | `1` |
 | `-u` | `--user` | Mountpoint directory owner user/group | Invoking user (`$SUDO_USER` / `$USER`) |
 | | `--tune-apm` | Tune ATA APM level on rotational HDDs (`128`, `254`, `off`) | None |
+| | `--no-persist-apm` | Disable writing persistent udev rule when tuning APM (runtime-only modification) | `False` |
+| | `--udev-match` | Udev matching strategy for APM persistence (`drive` or `uuid`) | `drive` |
+| | `--reload-udev` | Reload and trigger udev rules (standalone or with `--tune-apm`) | `False` |
 | | `--alloy-url` | HTTP endpoint for Grafana Alloy / Loki push | `http://127.0.0.1:9999` (or `$ALLOY_URL`) |
 | | `--no-telemetry` | Explicitly disable sending event breadcrumbs to Alloy/Loki | `False` |
 | `-y` | `--yes` | Non-interactive mode (skips confirmation prompts) | `False` |
@@ -208,7 +211,7 @@ sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
 
 ---
 
-## ⚡ HDD Power Management (APM) & The Thermal Trade-Off
+## ⚡ HDD Power Management (APM) & Udev Persistence
 
 ATA Advanced Power Management (APM) controls how aggressively rotational hard drives park their heads and enter low-power idle states. In a homelab, APM represents a fundamental trade-off between **mechanical head wear** and **operating temperatures**:
 
@@ -221,17 +224,60 @@ ATA Advanced Power Management (APM) controls how aggressively rotational hard dr
 * **APM 1–127**:
   - Aggressive power saving permitting spindle spindown. Not recommended for 24/7 NAS or media drives due to spin-up latency and spindle motor start/stop cycles.
 
-`drive_setup.py` provides **observational APM telemetry** in `--verify` without forcing changes automatically, and allows targeted, context-aware tuning via `--tune-apm <LEVEL>`.
+### 🛡️ Automated Udev Persistence (`/etc/udev/rules.d/69-hdparm-apm.rules`)
+By default, running `--tune-apm <LEVEL>` automatically creates or updates persistent rules in `/etc/udev/rules.d/69-hdparm-apm.rules` so settings survive server reboots:
+
+* **Default-On Persistence**: Automatically writes the rule unless you explicitly pass `--no-persist-apm` for transient runtime sessions.
+* **Udev Matching Strategies (`--udev-match {drive,uuid}`)**:
+  - **`--udev-match drive` (Default)**: Generates a kernel device name rule (`KERNEL=="sdX"`). As a safety guardrail, `drive_setup.py` checks that the drive has an active entry in `/etc/fstab` before writing this rule. If missing, it fails fast to protect you from drive-letter swap issues across reboots.
+  - **`--udev-match uuid`**: Binds the rule to the filesystem UUID (`ENV{ID_FS_UUID}=="<UUID>"`), completely immune to drive-letter shifts across USB ports or SATA controllers.
+* **Decoupled Udev Reloading (`--reload-udev`)**:
+  - Pass `--reload-udev` to trigger `udevadm control --reload-rules && udevadm trigger` immediately.
+  - In interactive mode, prompts whether to reload now (`[Y/n]`).
+  - In non-interactive or JSON mode, emits a pending notice with the exact reload command.
+  - Can also be executed standalone: `sudo ./drive_setup.py --reload-udev`.
+* **USB SAT Passthrough Robustness**: External USB enclosures often output `SG_IO: bad/missing sense data` on `stderr` when receiving ATA commands. `drive_setup.py` transparently absorbs these bridge warnings as long as the drive controller confirms `APM_level`.
 
 ---
 
-## 📡 Observability & Event Telemetry (Grafana Alloy & Loki)
+## 📡 Observability & Telemetry Gateway (Grafana Alloy & Loki)
 
-`drive_setup.py` includes a decoupled **`BreadcrumbPublisher`** gateway that sends structured JSON operational events to **Grafana Alloy** (`loki.source.api`) / Loki.
+`drive_setup.py` includes a decoupled **`BreadcrumbPublisher`** gateway that sends structured JSON operational breadcrumbs to **Grafana Alloy** (`loki.source.api`) / Loki.
 
-Whenever an operator changes drive power management via `--tune-apm`, a timestamped event breadcrumb is pushed over HTTP, enabling Grafana to render vertical annotation markers directly over temperature and load cycle graphs.
+Whenever an operator changes drive power management via `--tune-apm`, audits a drive via `--verify`, or discovers storage via `--scan`, structured observation breadcrumbs are pushed over HTTP:
 
-### 1. Alloy Configuration (`config.river`)
+### 1. Storage Observation Metrics (Ext4 & Hardware)
+Observation breadcrumbs emitted during `--verify` and `--scan` stream self-documenting efficiency and hardware metrics labeled by `device="sdX"`:
+
+```json
+{
+  "event": "storage_audit",
+  "action": "verify",
+  "device": "sdb1",
+  "parent_disk": "sdb",
+  "model": "WDC WD20SDRM-59A4DS1",
+  "size": "1.8T",
+  "is_rotational": true,
+  "apm_level": 128,
+  "apm_status": "Level 128 (Standard Idle)",
+  "fstype": "ext4",
+  "label": "The_Archives",
+  "mountpoint": "/mnt/TheArchives",
+  "ext4_root_reserved_pct": 1.0,
+  "ext4_root_reserved_gb": 18.63,
+  "ext4_reclaimable_space_gb": 0.0,
+  "ext4_inode_table_overhead_gb": 29.11,
+  "ext4_inode_ratio_profile": "default"
+}
+```
+
+* **`ext4_root_reserved_pct`**: Root block reservation percentage (`1.0%` homelab media standard vs `5.0%` OS default).
+* **`ext4_root_reserved_gb`**: Exact capacity reserved exclusively for root.
+* **`ext4_reclaimable_space_gb`**: Storage recoverable immediately by tuning reserved root blocks to 1% via `-trb -r 1`.
+* **`ext4_inode_table_overhead_gb`**: Disk space allocated to inode tables.
+* **`ext4_inode_ratio_profile`**: Inode density profile (`largefile`, `largefile4`, or `default`).
+
+### 2. Alloy Configuration (`config.river`)
 Declare a `loki.source.api` block in Alloy that feeds into your existing `loki.write` block:
 ```river
 loki.source.api "storage_hooks" {
@@ -241,13 +287,13 @@ loki.source.api "storage_hooks" {
   }
   forward_to = [loki.write.local_loki.receiver]
   labels = {
-    source = "drive_setup",
+    source = "homelab-drive-setup",
     job    = "storage_ops",
   }
 }
 ```
 
-### 2. Docker Compose Port Mapping
+### 3. Docker Compose Port Mapping
 Ensure Alloy's ingest port is mapped securely to the host:
 ```yaml
 services:
@@ -255,16 +301,14 @@ services:
     image: grafana/alloy:latest
     ports:
       - "127.0.0.1:9999:9999"
-    ...
 ```
 
-### 3. Grafana Dashboard Annotation Query
-In your Grafana dashboard settings (e.g. over a panel tracking **Temperature vs Head Parking**):
-* **Data Source**: `Loki`
-* **LogQL Query**: `{source="drive_setup", action="apm_tune"}`
-* **Text / Tooltip**: `APM tuned for {{device}}: {{old_apm}} → {{new_apm}}`
-
-Whenever `--tune-apm` is invoked, a vertical dashed event line instantly flags the exact moment of the configuration change on your graphs.
+### 4. Grafana Dashboard & LogQL Queries
+* **Vertical Annotation Markers**: Over panels tracking **Drive Temperature vs Head Parking**:
+  - **LogQL**: `{source="homelab-drive-setup", action="apm_tune"}`
+  - **Tooltip**: `APM tuned for {{device}}: {{old_apm}} → {{new_apm}}`
+* **Storage Efficiency Audit Queries**:
+  - **LogQL**: `{source="homelab-drive-setup", action="storage_audit"}`
 
 ---
 

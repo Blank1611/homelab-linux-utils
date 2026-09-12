@@ -471,6 +471,59 @@ class ActionPlan:
 
 
 # ==============================================================================
+# STORAGE OBSERVATION TELEMETRY PAYLOAD BUILDER
+# ==============================================================================
+def build_storage_observation_payload(
+    dev: BlockDevice,
+    state: DeviceState,
+    action: str,
+) -> Dict[str, Any]:
+    """
+    Builds a structured storage observation payload with self-documenting ext4 metrics,
+    suitable for pushing to Grafana Alloy / Loki as an operational breadcrumb.
+    """
+    res_bytes = state.reserved_space_bytes
+    res_pct = state.reserved_percent
+    root_reserved_gb: Optional[float] = None
+    reclaimable_gb: Optional[float] = None
+    inode_overhead_gb: Optional[float] = None
+
+    if res_bytes is not None:
+        root_reserved_gb = round(res_bytes / (1024 ** 3), 2)
+        if res_pct is not None and res_pct >= 3.0 and res_pct > 0:
+            target_1pct_bytes = (res_bytes / (res_pct / 100)) * 0.01
+            reclaimable_gb = round((res_bytes - target_1pct_bytes) / (1024 ** 3), 2)
+        else:
+            reclaimable_gb = 0.0
+
+    if state.inode_table_overhead_bytes is not None:
+        inode_overhead_gb = round(state.inode_table_overhead_bytes / (1024 ** 3), 2)
+
+    parent_disk_name = state.parent_device.path.replace("/dev/", "") if state.parent_device else None
+    device_name = dev.path.replace("/dev/", "") if dev.path else state.device_path.replace("/dev/", "")
+
+    return {
+        "event": "storage_audit",
+        "action": action,
+        "device": device_name,
+        "parent_disk": parent_disk_name,
+        "model": dev.model or (state.device.model if state.device else None) or (state.parent_device.model if state.parent_device else None),
+        "size": dev.size,
+        "is_rotational": state.is_rotational,
+        "apm_level": state.apm_level,
+        "apm_status": state.apm_status_label,
+        "fstype": state.fstype,
+        "label": state.label,
+        "mountpoint": state.current_mounts[0] if state.current_mounts else None,
+        "ext4_root_reserved_pct": res_pct,
+        "ext4_root_reserved_gb": root_reserved_gb,
+        "ext4_reclaimable_space_gb": reclaimable_gb,
+        "ext4_inode_table_overhead_gb": inode_overhead_gb,
+        "ext4_inode_ratio_profile": state.detected_inode_profile,
+    }
+
+
+# ==============================================================================
 # ERROR PRESENTER (STRATEGY PATTERN)
 # ==============================================================================
 class ErrorPresenter:
@@ -753,22 +806,6 @@ class DeviceInspector:
 
         out = (res.stdout or "") + (res.stderr or "")
 
-        if "Permission denied" in out or "bad/missing sense data" in out or (res.returncode != 0 and os.geteuid() != 0):
-            return (
-                None,
-                None,
-                "Requires root (sudo) to inspect via hdparm",
-                "Run with 'sudo' to inspect low-level ATA APM registers.",
-            )
-
-        if "not supported" in out.lower():
-            return (
-                False,
-                None,
-                "Not supported by device / enclosure",
-                "Drive firmware or USB bridge controller does not support ATA APM.",
-            )
-
         m = re.search(r"APM_level\s*=\s*(\w+)", out, re.IGNORECASE)
         if m:
             val_str = m.group(1).lower()
@@ -796,6 +833,22 @@ class DeviceInspector:
                 return (True, val, label, note)
             except ValueError:
                 return (True, None, f"Level {val_str}", f"APM reported value: {val_str}")
+
+        if "Permission denied" in out or (res.returncode != 0 and os.geteuid() != 0):
+            return (
+                None,
+                None,
+                "Requires root (sudo) to inspect via hdparm",
+                "Run with 'sudo' to inspect low-level ATA APM registers.",
+            )
+
+        if "not supported" in out.lower():
+            return (
+                False,
+                None,
+                "Not supported by device / enclosure",
+                "Drive firmware or USB bridge controller does not support ATA APM.",
+            )
 
         return (None, None, "Unknown APM status", "Could not parse APM output from hdparm.")
 
@@ -2187,6 +2240,121 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
 
 
 # ==============================================================================
+# UDEV APM PERSISTENCE & RELOAD HELPERS
+# ==============================================================================
+UDEV_APM_RULES_PATH = "/etc/udev/rules.d/69-hdparm-apm.rules"
+
+
+def reload_udev_rules(console: Optional[Console] = None) -> bool:
+    """Reloads and triggers udev rules via udevadm."""
+    logger.info("Reloading and triggering udev rules...")
+    if not shutil.which("udevadm"):
+        logger.warning("udevadm command not found. Cannot reload udev rules automatically.")
+        return False
+    try:
+        r1 = run_cmd(["udevadm", "control", "--reload-rules"], check=False, console=console)
+        r2 = run_cmd(["udevadm", "trigger"], check=False, console=console)
+        return r1.returncode == 0 and r2.returncode == 0
+    except Exception as err:
+        logger.warning(f"Failed to reload udev rules: {err}")
+        return False
+
+
+def persist_apm_udev_rule(
+    disk_path: str,
+    target_apm_str: str,
+    match_type: str,
+    state: DeviceState,
+    console: Console,
+    json_mode: bool = False,
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    Persists ATA APM setting into /etc/udev/rules.d/69-hdparm-apm.rules.
+    Returns: (success, rule_line, error_message)
+    """
+    disk_name = os.path.basename(os.path.realpath(disk_path))
+
+    if match_type == "drive":
+        # Guardrail: Check fstab persistence
+        is_fstab_persisted = state.in_fstab
+        if not is_fstab_persisted and state.child_partitions:
+            for child in state.child_partitions:
+                c_state = DeviceInspector.inspect(child.path)
+                if c_state.in_fstab:
+                    is_fstab_persisted = True
+                    break
+
+        if not is_fstab_persisted:
+            err_msg = (
+                f"Device '{disk_path}' has no persistent entry in /etc/fstab. "
+                "Matching by drive name ('KERNEL==\"sdX\"') is unsafe across reboots without an fstab entry. "
+                "Configure /etc/fstab persistence first using '--fstab', or persist APM by UUID using '--udev-match uuid'."
+            )
+            return False, "", err_msg
+
+        rule_line = f'ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="{disk_name}", ATTR{{queue/rotational}}=="1", RUN+="/sbin/hdparm -B {target_apm_str} /dev/%k"'
+        pattern_to_replace = f'KERNEL=="{disk_name}"'
+
+    elif match_type == "uuid":
+        target_uuid = state.uuid
+        if not target_uuid and state.child_partitions:
+            for child in state.child_partitions:
+                c_state = DeviceInspector.inspect(child.path)
+                if c_state.uuid:
+                    target_uuid = c_state.uuid
+                    break
+
+        if not target_uuid:
+            err_msg = (
+                f"Cannot persist APM by UUID: no filesystem UUID detected on '{disk_path}'. "
+                "Format the drive or use '--udev-match drive'."
+            )
+            return False, "", err_msg
+
+        rule_line = f'ACTION=="add|change", SUBSYSTEM=="block", ENV{{ID_FS_UUID}}=="{target_uuid}", ATTR{{queue/rotational}}=="1", RUN+="/sbin/hdparm -B {target_apm_str} /dev/%k"'
+        pattern_to_replace = f'ENV{{ID_FS_UUID}}=="{target_uuid}"'
+
+    else:
+        return False, "", f"Unknown udev match type '{match_type}'."
+
+    try:
+        rules_dir = Path("/etc/udev/rules.d")
+        if not rules_dir.exists():
+            rules_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_lines: List[str] = []
+        rules_path = Path(UDEV_APM_RULES_PATH)
+        if rules_path.exists():
+            existing_lines = rules_path.read_text(encoding="utf-8").splitlines()
+
+        new_lines: List[str] = []
+        replaced = False
+        header = "# Managed by drive_setup.py - ATA APM Power Management Rules"
+
+        for line in existing_lines:
+            if pattern_to_replace in line:
+                new_lines.append(rule_line)
+                replaced = True
+            else:
+                new_lines.append(line)
+
+        if not replaced:
+            if not any("Managed by drive_setup.py" in line for line in new_lines):
+                new_lines.insert(0, header)
+            new_lines.append(rule_line)
+
+        tmp_path = Path(f"{UDEV_APM_RULES_PATH}.tmp.{os.getpid()}")
+        tmp_path.write_text("\n".join(new_lines).strip() + "\n", encoding="utf-8")
+        tmp_path.chmod(0o644)
+        tmp_path.replace(rules_path)
+        logger.info(f"Persisted APM rule to {UDEV_APM_RULES_PATH}: {rule_line}")
+        return True, rule_line, None
+
+    except Exception as err:
+        return False, rule_line, f"Failed to write udev rule to {UDEV_APM_RULES_PATH}: {err}"
+
+
+# ==============================================================================
 # APM TUNING ROUTINE WITH BREADCRUMB TELEMETRY
 # ==============================================================================
 def do_tune_apm(
@@ -2195,17 +2363,24 @@ def do_tune_apm(
     assume_yes: bool,
     console: Console,
     breadcrumbs: BreadcrumbPublisher,
+    no_persist_apm: bool = False,
+    udev_match: str = "drive",
+    reload_udev: bool = False,
     json_mode: bool = False,
 ) -> int:
     """
     Tuning routine for ATA Advanced Power Management (APM) on rotational hard drives.
-    Provides context-aware thermal warnings and dispatches an event breadcrumb to Alloy/Loki.
+    Provides context-aware thermal warnings, persists settings via udev by default,
+    and dispatches an event breadcrumb to Alloy/Loki.
     """
     logger.info(f"Targeting APM tuning for device: {device} -> {target_apm_str}")
 
     eff_path, target_dev, parent_dev, _, _ = DeviceInspector.resolve_target(device)
     disk_path = parent_dev.path if parent_dev else (target_dev.path if target_dev else device)
     disk_name = os.path.basename(os.path.realpath(disk_path))
+
+    # Inspect device state for fstab checks & UUIDs
+    state = DeviceInspector.inspect(eff_path)
 
     # 1. Validation: Block Device Exists
     dev_obj = Path(disk_path)
@@ -2298,7 +2473,12 @@ def do_tune_apm(
     # 9. Execute hdparm
     logger.info(f"Applying APM level {target_apm_str} to {disk_path} via hdparm...")
     res = run_cmd(cmd, check=False, console=console)
-    if res.returncode != 0:
+    out = (res.stdout or "") + (res.stderr or "")
+    m = re.search(r"APM_level\s*=\s*(\w+)", out, re.IGNORECASE)
+
+    # If exit code != 0 and APM_level was NOT set in output, it failed.
+    # If APM_level is present in output, treat as success (absorbing USB SG_IO sense warnings).
+    if res.returncode != 0 and not m:
         err_msg = res.stderr.strip() or res.stdout.strip()
         ErrorPresenter.render_error(
             error_code="E_HDPARM_FAILED",
@@ -2312,7 +2492,50 @@ def do_tune_apm(
     # 10. Query Updated APM Status
     _, new_level, new_label, _ = DeviceInspector.get_apm_info(disk_path, is_rotational=True)
 
-    # 11. Dispatch Breadcrumb Event to Alloy/Loki
+    # 11. Udev Persistence (Enabled by default unless --no-persist-apm)
+    udev_persisted = False
+    udev_rule_line = None
+    reload_status = "none"
+
+    if not no_persist_apm:
+        success, rule_line, err_msg = persist_apm_udev_rule(
+            disk_path=disk_path,
+            target_apm_str=str(target_apm_str),
+            match_type=udev_match,
+            state=state,
+            console=console,
+            json_mode=json_mode,
+        )
+        if not success:
+            ErrorPresenter.render_error(
+                error_code="E_UDEV_PERSIST_FAILED",
+                message=err_msg or "Failed to persist APM setting into udev rules.",
+                remediation="Ensure fstab is configured, or use '--udev-match uuid', or pass '--no-persist-apm' for runtime-only tuning.",
+                console=console,
+                json_mode=json_mode,
+            )
+            return 1
+        udev_persisted = True
+        udev_rule_line = rule_line
+
+        # Handle udev reload
+        if reload_udev:
+            reloaded = reload_udev_rules(console=console)
+            reload_status = "reloaded" if reloaded else "failed"
+        elif sys.stdin.isatty() and not assume_yes and not json_mode:
+            try:
+                ans = input(f"\n{console.bold('Reload udev rules now to activate changes immediately? [Y/n]: ')}").strip().lower()
+                if ans in ("", "y", "yes"):
+                    reloaded = reload_udev_rules(console=console)
+                    reload_status = "reloaded" if reloaded else "failed"
+                else:
+                    reload_status = "pending"
+            except (EOFError, KeyboardInterrupt):
+                reload_status = "pending"
+        else:
+            reload_status = "pending"
+
+    # 12. Dispatch Breadcrumb Event to Alloy/Loki
     telemetry_sent = breadcrumbs.publish(
         action="apm_tune",
         device=disk_path,
@@ -2320,16 +2543,14 @@ def do_tune_apm(
             "old_apm": curr_level,
             "new_apm": target_apm_str,
             "resolved_level": new_level,
+            "persisted": udev_persisted,
+            "udev_match": udev_match if udev_persisted else None,
+            "udev_reload": reload_status,
             "note": thermal_advisory,
         },
     )
 
-    udev_snippet = (
-        f'ACTION=="add", SUBSYSTEM=="block", KERNEL=="{disk_name}", '
-        f'ATTR{{queue/rotational}}=="1", RUN+="/sbin/hdparm -B {target_apm_str} /dev/%k"'
-    )
-
-    # 12. Render Results
+    # 13. Render Results
     if json_mode:
         payload = {
             "status": "success",
@@ -2338,8 +2559,11 @@ def do_tune_apm(
             "old_apm": curr_level,
             "new_apm": target_apm_str,
             "resolved_status": new_label,
+            "persisted": udev_persisted,
+            "udev_rule": udev_rule_line,
+            "udev_reload": reload_status,
+            "reload_command": "sudo udevadm control --reload-rules && sudo udevadm trigger" if (udev_persisted and reload_status == "pending") else None,
             "telemetry_sent": telemetry_sent,
-            "persistence_hint": f"To persist across reboots, add to /etc/udev/rules.d/69-hdparm.rules: {udev_snippet}",
         }
         print(json.dumps(payload, indent=2), flush=True)
         return 0
@@ -2350,10 +2574,19 @@ def do_tune_apm(
         elif breadcrumbs.enabled:
             console.print(f"  [{console.dim('ℹ')}] Telemetry hook attempted (endpoint unreachable or timed out)")
 
-        console.print(f"\n{console.bold('Persistence Notice:')}")
-        console.print("  hdparm runtime settings are volatile and reset upon system reboot.")
-        console.print("  To persist this setting across reboots, add a rule in /etc/udev/rules.d/69-hdparm.rules:")
-        console.print(f"    {console.bold(udev_snippet)}\n")
+        if udev_persisted:
+            console.print(f"\n{console.green(console.bold('✓ Persistence:'))} Rule saved to {console.bold(UDEV_APM_RULES_PATH)}")
+            console.print(f"  Rule: {console.dim(udev_rule_line)}")
+            if reload_status == "reloaded":
+                console.print(f"  [{console.green('✓')}] Udev rules reloaded and triggered successfully.")
+            elif reload_status == "pending":
+                console.print(f"  [{console.cyan('ℹ')}] Udev reload pending. To reload rules immediately:")
+                console.print(f"      {console.bold('sudo udevadm control --reload-rules && sudo udevadm trigger')}")
+                console.print(f"      {console.dim('or run: sudo ./drive_setup.py --reload-udev')}")
+        else:
+            console.print(f"\n{console.yellow(console.bold('ℹ Persistence:'))} Running in transient mode (--no-persist-apm). Setting will reset upon reboot.")
+
+        console.print()
         return 0
 
 
@@ -2378,6 +2611,9 @@ def create_parser() -> argparse.ArgumentParser:
     setup_group.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1, homelab media standard)")
     setup_group.add_argument("-u", "--user", default=default_user, help=f"User who will own the mount point (default: {default_user})")
     setup_group.add_argument("--tune-apm", help="Tune ATA Advanced Power Management level on rotational HDDs (e.g. 128, 254, off)")
+    setup_group.add_argument("--no-persist-apm", action="store_true", help="Disable writing persistent udev rule when tuning APM (runtime-only modification)")
+    setup_group.add_argument("--udev-match", choices=["drive", "uuid"], default="drive", help="Udev rule matching strategy for APM persistence (default: drive, requires fstab entry)")
+    setup_group.add_argument("--reload-udev", action="store_true", help="Reload and trigger udev rules (can be used standalone or with --tune-apm)")
     setup_group.add_argument("--alloy-url", default=os.getenv("ALLOY_URL", "http://127.0.0.1:9999"), help="HTTP endpoint for Grafana Alloy / Loki push (default: http://127.0.0.1:9999 or ALLOY_URL env var)")
     setup_group.add_argument("--no-telemetry", action="store_true", help="Disable sending event breadcrumbs to Alloy/Loki")
     setup_group.add_argument("-y", "--yes", action="store_true", help="Skip interactive confirmation prompts")
@@ -2446,6 +2682,28 @@ def main() -> None:
         enabled=not args.no_telemetry,
     )
 
+    # Standalone Mode: Reload Udev Rules
+    has_step = any([args.format, args.mount, args.fstab, args.perms, args.tune_reserve_block, args.all])
+    if args.reload_udev and args.tune_apm is None and not args.verify and not args.scan and not args.unconfigured_only and not has_step:
+        if os.geteuid() != 0:
+            ErrorPresenter.render_error(
+                error_code="E_PERMISSION_DENIED",
+                message="Reloading udev rules requires root privileges.",
+                remediation=f"Re-run command with sudo: sudo {' '.join(sys.argv)}",
+                console=console,
+                json_mode=json_mode,
+            )
+            sys.exit(1)
+        success = reload_udev_rules(console=console)
+        if json_mode:
+            print(json.dumps({"status": "success" if success else "failed", "action": "reload_udev"}), flush=True)
+        else:
+            if success:
+                console.print(f"{console.green(console.bold('✓'))} Udev rules reloaded and triggered successfully.")
+            else:
+                console.print(f"{console.red(console.bold('✗'))} Failed to reload udev rules via udevadm.")
+        sys.exit(0 if success else 1)
+
     # Mode 1: Scan
     if args.scan or args.unconfigured_only:
         try:
@@ -2460,6 +2718,15 @@ def main() -> None:
                 extra=e.extra,
             )
             sys.exit(1)
+
+        # Dispatch individual observation breadcrumbs for discovered devices
+        if not args.unconfigured_only:
+            for dev, state in report.configured_devices:
+                obs_payload = build_storage_observation_payload(dev, state, action="scan")
+                breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=dev.path)
+        for unc in report.unconfigured_devices:
+            obs_payload = build_storage_observation_payload(unc.device, unc.state, action="scan")
+            breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=unc.device.path)
 
         if json_mode:
             sys.exit(ScanPresenter.render_json(report))
@@ -2493,6 +2760,11 @@ def main() -> None:
             )
             sys.exit(1)
 
+        # Dispatch observation telemetry breadcrumb for verified device
+        eff_dev = report.state.device or BlockDevice(name="", path=report.state.device_path, size="", type="")
+        obs_payload = build_storage_observation_payload(eff_dev, report.state, action="verify")
+        breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=report.state.device_path)
+
         if json_mode:
             sys.exit(VerifyPresenter.render_json(report))
         else:
@@ -2518,6 +2790,9 @@ def main() -> None:
             assume_yes=args.yes,
             console=console,
             breadcrumbs=breadcrumbs,
+            no_persist_apm=args.no_persist_apm,
+            udev_match=args.udev_match,
+            reload_udev=args.reload_udev,
             json_mode=json_mode,
         ))
 
