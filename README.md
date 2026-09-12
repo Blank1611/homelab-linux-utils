@@ -66,9 +66,9 @@ Example scan output:
 =======================================================================================================================================
                                              CONFIGURED & ACTIVE STORAGE DEVICES
 =======================================================================================================================================
-DEVICE         SIZE     FS (LABEL)             MOUNTPOINT               FSTAB   OWNER (PERMS)        INODES (OVERHEAD)          RESERVED SPACE
+DEVICE       SIZE    FS (LABEL)           MOUNTPOINT             FSTAB   APM          OWNER (PERMS)      INODES (OVERHEAD)        RESERVED SPACE
 ---------------------------------------------------------------------------------------------------------------------------------------
-/dev/sdb1      1.8T     ext4 ("storage_pool")  /mnt/storage             [✓]     <username> (755)     122.1M (29.1 GB ovh)       18.6 GB (1.0%)
+/dev/sdb1    1.8T    ext4 ("storage_pool  /mnt/storage           [✓]     128 (Bal)    <user> (755)       122.1M (29.1 GB ovh)     18.6 GB (1.0%)
 ---------------------------------------------------------------------------------------------------------------------------------------
 Total Configured: 1 drive(s) healthy and persistent.
 
@@ -215,13 +215,13 @@ sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
 
 ATA Advanced Power Management (APM) controls how aggressively rotational hard drives park their heads and enter low-power idle states. In a homelab, APM represents a fundamental trade-off between **mechanical head wear** and **operating temperatures**:
 
-* **APM 254 (Maximum Performance / Heads Loaded)**:
+* **APM 254 (Performance: No Head Parking / No Spindown)**:
   - Completely disables head parking and spindown. The heads remain flying over the platters with 0 wake latency and zero SMART `Load_Cycle_Count` incrementing.
   - **Thermal Penalty**: The voice coil and pre-amplifier electronics remain fully energized, continuously drawing 2–4W more power. In a drive cage with restricted airflow, this can push drive temperatures from **40°C up to 49°C+**, which accelerates motor bearing wear.
-* **APM 128 (Standard Homelab Idle - Recommended for Warm Drives)**:
+* **APM 128 (Balanced: Idle Head Parking / No Spindown - Recommended for Warm Drives)**:
   - Spindown is disabled (the spindle motor never stops spinning), but heads are permitted to park to the ramp during prolonged idle according to internal firmware timers.
   - **Thermal Benefit**: Runs **5°C to 8°C cooler**, keeping operating temperatures within the safe 35°C–42°C longevity window.
-* **APM 1–127**:
+* **APM 1–127 (Power Saving: Spindown Enabled)**:
   - Aggressive power saving permitting spindle spindown. Not recommended for 24/7 NAS or media drives due to spin-up latency and spindle motor start/stop cycles.
 
 ### 🛡️ Automated Udev Persistence (`/etc/udev/rules.d/69-hdparm-apm.rules`)
@@ -259,13 +259,12 @@ Observation breadcrumbs emitted during `--verify` and `--scan` stream self-docum
   "size": "1.8T",
   "is_rotational": true,
   "apm_level": 128,
-  "apm_status": "Level 128 (Standard Idle)",
+  "apm_status": "Level 128 (Balanced: Idle Head Parking / No Spindown)",
   "fstype": "ext4",
   "label": "The_Archives",
   "mountpoint": "/mnt/TheArchives",
   "ext4_root_reserved_pct": 1.0,
   "ext4_root_reserved_gb": 18.63,
-  "ext4_reclaimable_space_gb": 0.0,
   "ext4_inode_table_overhead_gb": 29.11,
   "ext4_inode_ratio_profile": "default"
 }
@@ -273,7 +272,6 @@ Observation breadcrumbs emitted during `--verify` and `--scan` stream self-docum
 
 * **`ext4_root_reserved_pct`**: Root block reservation percentage (`1.0%` homelab media standard vs `5.0%` OS default).
 * **`ext4_root_reserved_gb`**: Exact capacity reserved exclusively for root.
-* **`ext4_reclaimable_space_gb`**: Storage recoverable immediately by tuning reserved root blocks to 1% via `-trb -r 1`.
 * **`ext4_inode_table_overhead_gb`**: Disk space allocated to inode tables.
 * **`ext4_inode_ratio_profile`**: Inode density profile (`largefile`, `largefile4`, or `default`).
 

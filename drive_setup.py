@@ -284,11 +284,28 @@ class BreadcrumbPublisher:
         except Exception:
             self._hostname = "localhost"
 
+    def info(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+        """Publishes an informational operational breadcrumb (level: info)."""
+        return self.publish(action=action, payload=payload, device=device, level="info")
+
+    def warn(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+        """Publishes a warning operational breadcrumb (level: warn)."""
+        return self.publish(action=action, payload=payload, device=device, level="warn")
+
+    def error(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+        """Publishes an error operational breadcrumb (level: error)."""
+        return self.publish(action=action, payload=payload, device=device, level="error")
+
+    def debug(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+        """Publishes a debug operational breadcrumb (level: debug)."""
+        return self.publish(action=action, payload=payload, device=device, level="debug")
+
     def publish(
         self,
         action: str,
         payload: Dict[str, Any],
         device: Optional[str] = None,
+        level: str = "info",
     ) -> bool:
         """
         Accepts a structured payload, enriches it with contextual metadata,
@@ -298,15 +315,14 @@ class BreadcrumbPublisher:
             return False
 
         now_ns = str(time.time_ns())
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         # 1. Automatic Metadata Enrichment
         operator = os.getenv("SUDO_USER") or getpass.getuser()
         enriched_data = {
             "source": self.source,
             "action": action,
+            "level": level,
             "device": device,
-            "timestamp": now_iso,
             "host": self._hostname,
             "operator": operator,
             **payload,
@@ -316,6 +332,7 @@ class BreadcrumbPublisher:
         stream_labels = {
             "source": self.source,
             "action": action,
+            "level": level,
         }
         if device:
             stream_labels["device"] = device.replace("/dev/", "")
@@ -485,16 +502,10 @@ def build_storage_observation_payload(
     res_bytes = state.reserved_space_bytes
     res_pct = state.reserved_percent
     root_reserved_gb: Optional[float] = None
-    reclaimable_gb: Optional[float] = None
     inode_overhead_gb: Optional[float] = None
 
     if res_bytes is not None:
         root_reserved_gb = round(res_bytes / (1024 ** 3), 2)
-        if res_pct is not None and res_pct >= 3.0 and res_pct > 0:
-            target_1pct_bytes = (res_bytes / (res_pct / 100)) * 0.01
-            reclaimable_gb = round((res_bytes - target_1pct_bytes) / (1024 ** 3), 2)
-        else:
-            reclaimable_gb = 0.0
 
     if state.inode_table_overhead_bytes is not None:
         inode_overhead_gb = round(state.inode_table_overhead_bytes / (1024 ** 3), 2)
@@ -517,7 +528,6 @@ def build_storage_observation_payload(
         "mountpoint": state.current_mounts[0] if state.current_mounts else None,
         "ext4_root_reserved_pct": res_pct,
         "ext4_root_reserved_gb": root_reserved_gb,
-        "ext4_reclaimable_space_gb": reclaimable_gb,
         "ext4_inode_table_overhead_gb": inode_overhead_gb,
         "ext4_inode_ratio_profile": state.detected_inode_profile,
     }
@@ -794,6 +804,15 @@ class DeviceInspector:
                 "Install hdparm to inspect and tune ATA Power Management (sudo apt install hdparm).",
             )
 
+        # Sudo capability isolation: avoid spawning subprocess if unprivileged
+        if os.geteuid() != 0:
+            return (
+                None,
+                None,
+                "Requires root (sudo) to inspect via hdparm",
+                "Run with 'sudo' to inspect low-level ATA APM registers.",
+            )
+
         try:
             res = run_cmd(["hdparm", "-B", disk_path], check=False)
         except Exception as err:
@@ -819,13 +838,13 @@ class DeviceInspector:
             try:
                 val = int(val_str)
                 if val == 254:
-                    label = "Level 254 (Max Performance / Heads Loaded)"
+                    label = "Level 254 (Performance: No Head Parking / No Spindown)"
                     note = "Head parking disabled (0 wake latency / no cycle wear). Notice: Higher thermals (~+5°C to +8°C)."
                 elif 128 <= val <= 253:
-                    label = f"Level {val} (Standard Idle)"
+                    label = f"Level {val} (Balanced: Idle Head Parking / No Spindown)"
                     note = f"Spindown disabled, idle head parking active (cooler operation). Trade-off: APM 254 eliminates head parking but increases drive temps by 5°C-8°C."
                 elif 1 <= val <= 127:
-                    label = f"Level {val} (Power Saving - Spindown Enabled)"
+                    label = f"Level {val} (Power Saving: Spindown Enabled)"
                     note = "Aggressive power saving: spindle spindown permitted. Results in wake latency and spindle restart wear."
                 else:
                     label = f"Level {val}"
@@ -1464,7 +1483,7 @@ class ScanPresenter:
             console.print(f"{' ' * 45}{console.green(console.bold('CONFIGURED & ACTIVE STORAGE DEVICES'))}")
             console.rule("=", 135)
 
-            header_cfg = f"{'DEVICE':<14} {'SIZE':<8} {'FS (LABEL)':<22} {'MOUNTPOINT':<24} {'FSTAB':<7} {'OWNER (PERMS)':<20} {'INODES (OVERHEAD)':<26} {'RESERVED SPACE'}"
+            header_cfg = f"{'DEVICE':<12} {'SIZE':<7} {'FS (LABEL)':<20} {'MOUNTPOINT':<22} {'FSTAB':<7} {'APM':<12} {'OWNER (PERMS)':<18} {'INODES (OVERHEAD)':<24} {'RESERVED SPACE'}"
             console.print(console.bold(header_cfg))
             console.print("-" * 135)
 
@@ -1478,16 +1497,35 @@ class ScanPresenter:
                     fs_label = state.fstype or "unknown"
                     if state.label:
                         fs_label = f'{fs_label} ("{state.label}")'
-                    fs_label_str = fs_label[:21]
+                    fs_label_str = fs_label[:19]
 
-                    mp_str = (state.current_mounts[0] if state.current_mounts else "-")[:23]
+                    mp_str = (state.current_mounts[0] if state.current_mounts else "-")[:21]
                     fstab_cell = f"{console.green('[✓]')}    " if state.in_fstab else f"{console.red('[✗]')}    "
+
+                    # APM column
+                    if state.is_rotational is False:
+                        apm_str = "SSD (N/A)"
+                    elif os.geteuid() != 0:
+                        apm_str = "N/A (sudo)"
+                        has_sudo_na = True
+                    elif state.apm_level is not None:
+                        if state.apm_level == 254:
+                            apm_str = "254 (Perf)"
+                        elif 128 <= state.apm_level <= 253:
+                            apm_str = f"{state.apm_level} (Bal)"
+                        elif 1 <= state.apm_level <= 127:
+                            apm_str = f"{state.apm_level} (Pwr)"
+                        else:
+                            apm_str = f"Lvl {state.apm_level}"
+                    else:
+                        apm_str = "Not supp"
+                    apm_cell = f"{apm_str:<12}"
 
                     owner_perms = "-"
                     if state.mountpoint_owner:
                         perms = state.mountpoint_perms or "???"
                         owner_perms = f"{state.mountpoint_owner} ({perms})"
-                    owner_perms_str = owner_perms[:19]
+                    owner_perms_str = owner_perms[:17]
 
                     # Ext4 metrics
                     if state.fstype == "ext4":
@@ -1514,29 +1552,29 @@ class ScanPresenter:
                             res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
                             reserved_text = f"{res_gb:.1f} GB ({res_pct:.1f}%)"
 
-                            inode_cell = f"{inode_text:<26}"
+                            inode_cell = f"{inode_text:<24}"
                             reserved_cell = reserved_text
                         else:
-                            inode_cell = f"{console.yellow('N/A (sudo required)')}       "
+                            inode_cell = f"{console.yellow('N/A (sudo required)')}     "
                             reserved_cell = f"{console.yellow('N/A (sudo required)')}"
                             has_sudo_na = True
                     else:
-                        inode_cell = f"{'N/A (non-ext4)':<26}"
+                        inode_cell = f"{'N/A (non-ext4)':<24}"
                         reserved_cell = "N/A (non-ext4)"
 
-                    console.print(f"{dev_path:<14} {size_str:<8} {fs_label_str:<22} {mp_str:<24} {fstab_cell} {owner_perms_str:<20} {inode_cell} {reserved_cell}")
+                    console.print(f"{dev_path:<12} {size_str:<7} {fs_label_str:<20} {mp_str:<22} {fstab_cell} {apm_cell} {owner_perms_str:<18} {inode_cell} {reserved_cell}")
 
             console.print("-" * 135)
             console.print(f"Total Configured: {console.bold(str(len(configured_devices)))} drive(s) healthy and persistent.")
             if has_sudo_na:
-                console.print(f"  {console.yellow('ℹ Note:')} Run with {console.bold('sudo')} to calculate ext4 inode table overhead and reserved space.")
+                console.print(f"  {console.cyan('ℹ')} Note: Run with sudo to inspect APM power levels, ext4 inode table overhead, and reserved space.")
             console.print("")
 
         # --------------------------------------------------------------------------
         # SECTION 2: UNCONFIGURED / AVAILABLE STORAGE DEVICES (Always rendered)
         # --------------------------------------------------------------------------
         console.rule("=", 135)
-        console.print(f"{' ' * 44}{console.cyan(console.bold('UNCONFIGURED / AVAILABLE STORAGE DEVICES'))}")
+        console.print(f"{' ' * 42}{console.cyan(console.bold('UNCONFIGURED / AVAILABLE STORAGE DEVICES'))}")
         console.rule("=", 135)
 
         header_unc = f"{'DEVICE':<14} {'SIZE':<8} {'TYPE':<6} {'MODEL':<22} {'FS':<8} {'STATUS':<24} {'DETAILS'}"
@@ -1557,12 +1595,16 @@ class ScanPresenter:
                 elif dev.model:
                     model = dev.model
 
-                model_str = (model or "Generic")[:20]
+                model_str = (model or "Generic")[:21]
                 fs_str = (state.fstype or "-")[:7]
 
                 details = item.details
                 if state.label:
                     details = f"Label: '{state.label}', {details}"
+                if state.is_rotational is False:
+                    details = f"{details} [SSD]"
+                elif state.apm_level:
+                    details = f"{details} [APM: {state.apm_level}]"
 
                 if item.status == "RAW_UNFORMATTED":
                     colored_badge = console.yellow(item.status_badge)
@@ -1591,6 +1633,9 @@ class ScanPresenter:
                 "device": dev.path,
                 "size": dev.size or (st.device.size if st.device else None),
                 "is_rotational": st.is_rotational,
+                "apm_level": st.apm_level,
+                "apm_status": st.apm_status_label,
+                "apm_supported": st.apm_supported,
                 "fstype": st.fstype,
                 "label": st.label,
                 "uuid": st.uuid,
@@ -1626,6 +1671,9 @@ class ScanPresenter:
                 "size": dev.size,
                 "type": dev.type,
                 "is_rotational": st.is_rotational,
+                "apm_level": st.apm_level,
+                "apm_status": st.apm_status_label,
+                "apm_supported": st.apm_supported,
                 "model": model or None,
                 "fstype": st.fstype,
                 "label": st.label,
@@ -2536,7 +2584,7 @@ def do_tune_apm(
             reload_status = "pending"
 
     # 12. Dispatch Breadcrumb Event to Alloy/Loki
-    telemetry_sent = breadcrumbs.publish(
+    telemetry_sent = breadcrumbs.info(
         action="apm_tune",
         device=disk_path,
         payload={
@@ -2719,14 +2767,17 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Dispatch individual observation breadcrumbs for discovered devices
-        if not args.unconfigured_only:
-            for dev, state in report.configured_devices:
-                obs_payload = build_storage_observation_payload(dev, state, action="scan")
-                breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=dev.path)
-        for unc in report.unconfigured_devices:
-            obs_payload = build_storage_observation_payload(unc.device, unc.state, action="scan")
-            breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=unc.device.path)
+        # Dispatch individual observation breadcrumbs for discovered devices (requires sudo)
+        if os.geteuid() == 0:
+            if not args.unconfigured_only:
+                for dev, state in report.configured_devices:
+                    obs_payload = build_storage_observation_payload(dev, state, action="scan")
+                    breadcrumbs.info(action="storage_audit", payload=obs_payload, device=dev.path)
+            for unc in report.unconfigured_devices:
+                obs_payload = build_storage_observation_payload(unc.device, unc.state, action="scan")
+                breadcrumbs.info(action="storage_audit", payload=obs_payload, device=unc.device.path)
+        else:
+            logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
 
         if json_mode:
             sys.exit(ScanPresenter.render_json(report))
@@ -2760,10 +2811,13 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Dispatch observation telemetry breadcrumb for verified device
-        eff_dev = report.state.device or BlockDevice(name="", path=report.state.device_path, size="", type="")
-        obs_payload = build_storage_observation_payload(eff_dev, report.state, action="verify")
-        breadcrumbs.publish(action="storage_audit", payload=obs_payload, device=report.state.device_path)
+        # Dispatch observation telemetry breadcrumb for verified device (requires sudo)
+        if os.geteuid() == 0:
+            eff_dev = report.state.device or BlockDevice(name="", path=report.state.device_path, size="", type="")
+            obs_payload = build_storage_observation_payload(eff_dev, report.state, action="verify")
+            breadcrumbs.info(action="storage_audit", payload=obs_payload, device=report.state.device_path)
+        else:
+            logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
 
         if json_mode:
             sys.exit(VerifyPresenter.render_json(report))
@@ -2808,6 +2862,16 @@ def main() -> None:
         )
         if not json_mode:
             parser.print_help(sys.stderr)
+        sys.exit(1)
+
+    if os.geteuid() != 0:
+        ErrorPresenter.render_error(
+            error_code="E_PERMISSION_DENIED",
+            message="Modifying storage configuration requires administrative privileges (sudo).",
+            remediation=f"Re-run command with sudo: sudo {' '.join(sys.argv)}",
+            console=console,
+            json_mode=json_mode,
+        )
         sys.exit(1)
 
     if not args.device:
