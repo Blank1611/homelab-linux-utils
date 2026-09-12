@@ -18,13 +18,16 @@ import json
 import logging
 import os
 import pwd
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ==============================================================================
 # TERMINAL CAPABILITIES & FORMATTING CONSOLE
@@ -70,6 +73,9 @@ class Console:
 
     def blue(self, text: str) -> str:
         return f"\033[34m{text}\033[0m" if self._enabled else str(text)
+
+    def dim(self, text: str) -> str:
+        return f"\033[2m{text}\033[0m" if self._enabled else str(text)
 
     def print(self, *args, **kwargs) -> None:
         if "file" not in kwargs:
@@ -253,6 +259,96 @@ def run_cmd(
 
 
 # ==============================================================================
+# TELEMETRY & EVENT BREADCRUMBS GATEWAY
+# ==============================================================================
+class BreadcrumbPublisher:
+    """
+    Independent event telemetry gateway for shipping structured operational
+    breadcrumbs to Grafana Alloy (loki.source.api) / Loki.
+    Decoupled from storage logic; fail-safe and non-blocking.
+    """
+
+    def __init__(
+        self,
+        source: str,
+        endpoint_url: Optional[str] = None,
+        timeout: float = 1.0,
+        enabled: bool = True,
+    ):
+        self.source = source
+        self.endpoint_url = endpoint_url
+        self.timeout = timeout
+        self.enabled = enabled and bool(self.endpoint_url)
+        try:
+            self._hostname = socket.gethostname()
+        except Exception:
+            self._hostname = "localhost"
+
+    def publish(
+        self,
+        action: str,
+        payload: Dict[str, Any],
+        device: Optional[str] = None,
+    ) -> bool:
+        """
+        Accepts a structured payload, enriches it with contextual metadata,
+        and pushes it to the configured Alloy/Loki HTTP endpoint.
+        """
+        if not self.enabled:
+            return False
+
+        now_ns = str(time.time_ns())
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        # 1. Automatic Metadata Enrichment
+        operator = os.getenv("SUDO_USER") or getpass.getuser()
+        enriched_data = {
+            "source": self.source,
+            "action": action,
+            "device": device,
+            "timestamp": now_iso,
+            "host": self._hostname,
+            "operator": operator,
+            **payload,
+        }
+
+        # 2. Loki Push Schema Assembly
+        stream_labels = {
+            "source": self.source,
+            "action": action,
+        }
+        if device:
+            stream_labels["device"] = device.replace("/dev/", "")
+
+        body = {
+            "streams": [
+                {
+                    "stream": stream_labels,
+                    "values": [
+                        [now_ns, json.dumps(enriched_data)]
+                    ],
+                }
+            ]
+        }
+
+        # 3. Fail-Safe HTTP Transport
+        target_url = f"{self.endpoint_url.rstrip('/')}/loki/api/v1/push"
+        try:
+            req = urllib.request.Request(
+                target_url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                logger.debug(f"Telemetry breadcrumb sent to {target_url} (HTTP {resp.status})")
+                return resp.status in (200, 204)
+        except Exception as err:
+            logger.debug(f"Telemetry publish to {target_url} skipped/failed: {err}")
+            return False
+
+
+# ==============================================================================
 # DATA MODELS
 # ==============================================================================
 @dataclass
@@ -266,6 +362,7 @@ class BlockDevice:
     uuid: Optional[str] = None
     mountpoints: List[str] = field(default_factory=list)
     model: Optional[str] = None
+    rotational: Optional[bool] = None
     children: List["BlockDevice"] = field(default_factory=list)
 
 
@@ -314,6 +411,12 @@ class DeviceState:
     reserved_space_bytes: Optional[int] = None
     reserved_percent: Optional[float] = None
     detected_inode_profile: Optional[str] = None
+    # Hardware & Power Management (APM)
+    is_rotational: Optional[bool] = None
+    apm_supported: Optional[bool] = None
+    apm_level: Optional[int] = None
+    apm_status_label: Optional[str] = None
+    apm_thermal_note: Optional[str] = None
 
 
 @dataclass
@@ -556,6 +659,14 @@ class DeviceInspector:
 
         mounts = [m for m in mounts if m]
 
+        rota_raw = data.get("rota")
+        rotational: Optional[bool] = None
+        if rota_raw is not None:
+            if isinstance(rota_raw, bool):
+                rotational = rota_raw
+            elif isinstance(rota_raw, (int, str)):
+                rotational = str(rota_raw).strip().lower() in ("1", "true")
+
         dev = BlockDevice(
             name=data.get("name", ""),
             path=data.get("path") or f"/dev/{data.get('name', '')}",
@@ -566,6 +677,7 @@ class DeviceInspector:
             uuid=data.get("uuid") or None,
             mountpoints=mounts,
             model=(data.get("model") or "").strip() or None,
+            rotational=rotational,
         )
 
         for child in data.get("children", []):
@@ -575,7 +687,7 @@ class DeviceInspector:
 
     @classmethod
     def get_all_block_devices(cls) -> List[BlockDevice]:
-        cmd = ["lsblk", "-J", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS,MODEL"]
+        cmd = ["lsblk", "-J", "-o", "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS,MODEL,ROTA"]
         try:
             res = run_cmd(cmd, check=True)
             parsed = json.loads(res.stdout)
@@ -584,6 +696,108 @@ class DeviceInspector:
         except Exception as err:
             logger.error(f"Failed to query block devices via lsblk: {err}")
             return []
+
+    @classmethod
+    def is_device_rotational(cls, dev_name_or_path: str) -> bool:
+        """
+        Check if device is a rotational HDD (1) vs SSD/NVMe (0).
+        Inspects /sys/block/<disk>/queue/rotational first, falls back to lsblk.
+        """
+        clean_name = os.path.basename(os.path.realpath(dev_name_or_path))
+        disk_name = clean_name
+        if disk_name.startswith("nvme") or disk_name.startswith("mmcblk"):
+            if "p" in disk_name:
+                disk_name = disk_name.rsplit("p", 1)[0]
+        else:
+            disk_name = disk_name.rstrip("0123456789")
+
+        sysfs_rota = Path(f"/sys/block/{disk_name}/queue/rotational")
+        if sysfs_rota.exists():
+            try:
+                return sysfs_rota.read_text().strip() == "1"
+            except Exception:
+                pass
+        return True
+
+    @classmethod
+    def get_apm_info(cls, disk_path: str, is_rotational: bool) -> Tuple[Optional[bool], Optional[int], str, str]:
+        """
+        Queries ATA Advanced Power Management (APM) via hdparm on rotational disks.
+        Returns: (apm_supported, apm_level, status_label, thermal_note)
+        """
+        if not is_rotational:
+            return (
+                False,
+                None,
+                "N/A (Solid State Drive)",
+                "Solid State Drives (SSDs/NVMe) do not use ATA APM.",
+            )
+
+        if not shutil.which("hdparm"):
+            return (
+                None,
+                None,
+                "N/A (hdparm utility not installed)",
+                "Install hdparm to inspect and tune ATA Power Management (sudo apt install hdparm).",
+            )
+
+        try:
+            res = run_cmd(["hdparm", "-B", disk_path], check=False)
+        except Exception as err:
+            return (
+                None,
+                None,
+                f"Error querying APM: {err}",
+                "Unable to execute hdparm command.",
+            )
+
+        out = (res.stdout or "") + (res.stderr or "")
+
+        if "Permission denied" in out or "bad/missing sense data" in out or (res.returncode != 0 and os.geteuid() != 0):
+            return (
+                None,
+                None,
+                "Requires root (sudo) to inspect via hdparm",
+                "Run with 'sudo' to inspect low-level ATA APM registers.",
+            )
+
+        if "not supported" in out.lower():
+            return (
+                False,
+                None,
+                "Not supported by device / enclosure",
+                "Drive firmware or USB bridge controller does not support ATA APM.",
+            )
+
+        m = re.search(r"APM_level\s*=\s*(\w+)", out, re.IGNORECASE)
+        if m:
+            val_str = m.group(1).lower()
+            if val_str == "off":
+                return (
+                    True,
+                    255,
+                    "Disabled (off)",
+                    "APM is disabled. Heads remain loaded; maximum performance with higher idle power.",
+                )
+            try:
+                val = int(val_str)
+                if val == 254:
+                    label = "Level 254 (Max Performance / Heads Loaded)"
+                    note = "Head parking disabled (0 wake latency / no cycle wear). Notice: Higher thermals (~+5°C to +8°C)."
+                elif 128 <= val <= 253:
+                    label = f"Level {val} (Standard Idle)"
+                    note = f"Spindown disabled, idle head parking active (cooler operation). Trade-off: APM 254 eliminates head parking but increases drive temps by 5°C-8°C."
+                elif 1 <= val <= 127:
+                    label = f"Level {val} (Power Saving - Spindown Enabled)"
+                    note = "Aggressive power saving: spindle spindown permitted. Results in wake latency and spindle restart wear."
+                else:
+                    label = f"Level {val}"
+                    note = f"Current APM level: {val}."
+                return (True, val, label, note)
+            except ValueError:
+                return (True, None, f"Level {val_str}", f"APM reported value: {val_str}")
+
+        return (None, None, "Unknown APM status", "Could not parse APM output from hdparm.")
 
     @classmethod
     def find_device_and_parent(cls, target_path: str) -> Tuple[Optional[BlockDevice], Optional[BlockDevice]]:
@@ -781,6 +995,15 @@ class DeviceInspector:
             except Exception:
                 pass
 
+        # Query hardware / rotational topology and APM
+        parent_disk_path = state.parent_device.path if state.parent_device else state.device_path
+        state.is_rotational = cls.is_device_rotational(parent_disk_path)
+        apm_supp, apm_lvl, apm_lbl, apm_note = cls.get_apm_info(parent_disk_path, state.is_rotational)
+        state.apm_supported = apm_supp
+        state.apm_level = apm_lvl
+        state.apm_status_label = apm_lbl
+        state.apm_thermal_note = apm_note
+
         return state
 
 
@@ -969,6 +1192,27 @@ class VerifyPresenter:
                 else:
                     console.print(f"  {console.yellow('[!]')} tune2fs could not read ext4 geometry for {state.device_path}.")
 
+        # Hardware & Power Management (APM)
+        console.print("-" * 70)
+        console.print(f"{console.bold('HARDWARE & POWER MANAGEMENT (APM):')}")
+        if state.is_rotational is False:
+            console.print(f"  [{console.cyan('ℹ')}] ATA Power Mgmt (APM):         {console.dim('N/A (Solid State Drive)')}")
+        elif state.apm_level is not None:
+            if state.apm_level == 254:
+                badge = console.green("ℹ")
+            elif 128 <= state.apm_level <= 253:
+                badge = console.cyan("ℹ")
+            else:
+                badge = console.yellow("ℹ")
+            console.print(f"  [{badge}] ATA Power Mgmt (APM):         {console.bold(state.apm_status_label or f'Level {state.apm_level}')}")
+            if state.apm_thermal_note:
+                console.print(f"      {console.dim(state.apm_thermal_note)}")
+        else:
+            status_text = state.apm_status_label or "Not supported or unavailable"
+            console.print(f"  [{console.cyan('ℹ')}] ATA Power Mgmt (APM):         {status_text}")
+            if state.apm_thermal_note:
+                console.print(f"      {console.dim(state.apm_thermal_note)}")
+
         console.print("-" * 70)
         if report.all_healthy:
             console.print(f"{console.green(console.bold('✓ AUDIT RESULT: Storage setup is complete, healthy, and persistent!'))}")
@@ -1048,6 +1292,13 @@ class VerifyPresenter:
                 "reserved_space_bytes": state.reserved_space_bytes,
                 "reserved_percent": state.reserved_percent,
             } if state.fstype == "ext4" else None,
+            "apm": {
+                "is_rotational": state.is_rotational,
+                "supported": state.apm_supported,
+                "level": state.apm_level,
+                "status": state.apm_status_label,
+                "thermal_tradeoff_note": state.apm_thermal_note,
+            },
             "all_healthy": report.all_healthy,
             "missing_steps": report.missing_steps,
             "recommended_command": f"sudo ./drive_setup.py -d {state.device_path} -m {report.target_mountpoint or '/mnt/storage'} --all" if report.missing_steps else None,
@@ -1286,6 +1537,7 @@ class ScanPresenter:
             cfg_out.append({
                 "device": dev.path,
                 "size": dev.size or (st.device.size if st.device else None),
+                "is_rotational": st.is_rotational,
                 "fstype": st.fstype,
                 "label": st.label,
                 "uuid": st.uuid,
@@ -1320,6 +1572,7 @@ class ScanPresenter:
                 "device": dev.path,
                 "size": dev.size,
                 "type": dev.type,
+                "is_rotational": st.is_rotational,
                 "model": model or None,
                 "fstype": st.fstype,
                 "label": st.label,
@@ -1934,6 +2187,177 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
 
 
 # ==============================================================================
+# APM TUNING ROUTINE WITH BREADCRUMB TELEMETRY
+# ==============================================================================
+def do_tune_apm(
+    device: str,
+    target_apm_str: str,
+    assume_yes: bool,
+    console: Console,
+    breadcrumbs: BreadcrumbPublisher,
+    json_mode: bool = False,
+) -> int:
+    """
+    Tuning routine for ATA Advanced Power Management (APM) on rotational hard drives.
+    Provides context-aware thermal warnings and dispatches an event breadcrumb to Alloy/Loki.
+    """
+    logger.info(f"Targeting APM tuning for device: {device} -> {target_apm_str}")
+
+    eff_path, target_dev, parent_dev, _, _ = DeviceInspector.resolve_target(device)
+    disk_path = parent_dev.path if parent_dev else (target_dev.path if target_dev else device)
+    disk_name = os.path.basename(os.path.realpath(disk_path))
+
+    # 1. Validation: Block Device Exists
+    dev_obj = Path(disk_path)
+    if not dev_obj.exists() or not dev_obj.is_block_device():
+        ErrorPresenter.render_error(
+            error_code="E_INVALID_DEVICE",
+            message=f"Target disk '{disk_path}' is not a valid block device on this system.",
+            remediation="Use './drive_setup.py --scan' to discover valid disks.",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 2. Validation: Rotational HDD
+    is_rotational = DeviceInspector.is_device_rotational(disk_path)
+    if not is_rotational:
+        ErrorPresenter.render_error(
+            error_code="E_NOT_ROTATIONAL",
+            message=f"Device '{disk_path}' is a non-rotational Solid State Drive (SSD/NVMe).",
+            remediation="ATA APM power management is only applicable to rotational hard disk drives.",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 3. Validation: Root Privileges
+    if os.geteuid() != 0:
+        ErrorPresenter.render_error(
+            error_code="E_PERMISSION_DENIED",
+            message="APM tuning requires root privileges to modify ATA controller registers.",
+            remediation=f"Re-run command with sudo: sudo {' '.join(sys.argv)}",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 4. Validation: hdparm availability
+    if not shutil.which("hdparm"):
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_HDPARM",
+            message="The 'hdparm' utility is required to inspect and tune APM.",
+            remediation="Install hdparm: sudo apt install hdparm",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 5. Query Current APM Level
+    apm_supp, curr_level, curr_label, _ = DeviceInspector.get_apm_info(disk_path, is_rotational=True)
+
+    # 6. Parse and Validate Target APM Level
+    val_clean = str(target_apm_str).strip().lower()
+    if val_clean not in ("off", "disabled") and not val_clean.isdigit():
+        ErrorPresenter.render_error(
+            error_code="E_INVALID_APM_VALUE",
+            message=f"Invalid APM value '{target_apm_str}'.",
+            remediation="Specify an integer from 1 to 255 (e.g. 128, 254) or 'off'.",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 7. Context-Aware Thermal vs Mechanical Advisory
+    if val_clean in ("254", "off", "disabled", "255"):
+        thermal_advisory = (
+            "Setting APM to 254 keeps drive heads loaded continuously, eliminating wake latency "
+            "and load/unload cycle wear. NOTICE: Idle power draw increases by ~2-4W, raising drive "
+            "operating temperatures by 5°C to 8°C. Ensure adequate chassis airflow."
+        )
+    elif val_clean == "128":
+        thermal_advisory = (
+            "Setting APM to 128 disables spindown while allowing heads to park during idle according "
+            "to firmware timers. This balances mechanical wear and thermal dissipation (runs cooler)."
+        )
+    else:
+        thermal_advisory = f"Configuring ATA APM level {target_apm_str} on {disk_path}."
+
+    # 8. User Confirmation
+    cmd = ["hdparm", "-B", str(target_apm_str), disk_path]
+    confirm(
+        explanation=thermal_advisory,
+        action_message=f"Tune ATA APM level on {disk_path} to {target_apm_str}",
+        cmd=cmd,
+        assume_yes=assume_yes,
+        console=console,
+        json_mode=json_mode,
+        step_name="TUNE_APM",
+    )
+
+    # 9. Execute hdparm
+    logger.info(f"Applying APM level {target_apm_str} to {disk_path} via hdparm...")
+    res = run_cmd(cmd, check=False, console=console)
+    if res.returncode != 0:
+        err_msg = res.stderr.strip() or res.stdout.strip()
+        ErrorPresenter.render_error(
+            error_code="E_HDPARM_FAILED",
+            message=f"Failed to set APM level on {disk_path}: {err_msg}",
+            remediation="Verify disk is connected via native SATA or a bridge that supports SAT passthrough.",
+            console=console,
+            json_mode=json_mode,
+        )
+        return 1
+
+    # 10. Query Updated APM Status
+    _, new_level, new_label, _ = DeviceInspector.get_apm_info(disk_path, is_rotational=True)
+
+    # 11. Dispatch Breadcrumb Event to Alloy/Loki
+    telemetry_sent = breadcrumbs.publish(
+        action="apm_tune",
+        device=disk_path,
+        payload={
+            "old_apm": curr_level,
+            "new_apm": target_apm_str,
+            "resolved_level": new_level,
+            "note": thermal_advisory,
+        },
+    )
+
+    udev_snippet = (
+        f'ACTION=="add", SUBSYSTEM=="block", KERNEL=="{disk_name}", '
+        f'ATTR{{queue/rotational}}=="1", RUN+="/sbin/hdparm -B {target_apm_str} /dev/%k"'
+    )
+
+    # 12. Render Results
+    if json_mode:
+        payload = {
+            "status": "success",
+            "mode": "tune_apm",
+            "device": disk_path,
+            "old_apm": curr_level,
+            "new_apm": target_apm_str,
+            "resolved_status": new_label,
+            "telemetry_sent": telemetry_sent,
+            "persistence_hint": f"To persist across reboots, add to /etc/udev/rules.d/69-hdparm.rules: {udev_snippet}",
+        }
+        print(json.dumps(payload, indent=2), flush=True)
+        return 0
+    else:
+        console.print(f"\n{console.green(console.bold('✓ APM level successfully updated:'))} {disk_path} -> {console.bold(new_label)}")
+        if telemetry_sent:
+            console.print(f"  [{console.green('✓')}] Telemetry breadcrumb dispatched to Alloy/Loki ({breadcrumbs.endpoint_url})")
+        elif breadcrumbs.enabled:
+            console.print(f"  [{console.dim('ℹ')}] Telemetry hook attempted (endpoint unreachable or timed out)")
+
+        console.print(f"\n{console.bold('Persistence Notice:')}")
+        console.print("  hdparm runtime settings are volatile and reset upon system reboot.")
+        console.print("  To persist this setting across reboots, add a rule in /etc/udev/rules.d/69-hdparm.rules:")
+        console.print(f"    {console.bold(udev_snippet)}\n")
+        return 0
+
+
+# ==============================================================================
 # CLI PARSER DEFINITION
 # ==============================================================================
 def create_parser() -> argparse.ArgumentParser:
@@ -1953,6 +2377,9 @@ def create_parser() -> argparse.ArgumentParser:
     setup_group.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage (largefile: 1MB/inode, largefile4: 4MB/inode, default: 16KB/inode)")
     setup_group.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1, homelab media standard)")
     setup_group.add_argument("-u", "--user", default=default_user, help=f"User who will own the mount point (default: {default_user})")
+    setup_group.add_argument("--tune-apm", help="Tune ATA Advanced Power Management level on rotational HDDs (e.g. 128, 254, off)")
+    setup_group.add_argument("--alloy-url", default=os.getenv("ALLOY_URL", "http://127.0.0.1:9999"), help="HTTP endpoint for Grafana Alloy / Loki push (default: http://127.0.0.1:9999 or ALLOY_URL env var)")
+    setup_group.add_argument("--no-telemetry", action="store_true", help="Disable sending event breadcrumbs to Alloy/Loki")
     setup_group.add_argument("-y", "--yes", action="store_true", help="Skip interactive confirmation prompts")
     setup_group.add_argument("-f", "--force", action="store_true", help="Force operations (override data protection and remount)")
     setup_group.add_argument("-v", "--verbose", action="store_true", default=True, help="Enable verbose debug logging (default: True)")
@@ -1988,6 +2415,9 @@ def create_parser() -> argparse.ArgumentParser:
 
   # 5. Mount an existing formatted drive and cascade fstab, perms & tuning:
   sudo ./drive_setup.py -d /dev/sdb1 -m /mnt/storage -mnt
+
+  # 6. Tune ATA Advanced Power Management (APM) on an HDD with breadcrumb event:
+  sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
 """
     return parser
 
@@ -2009,6 +2439,12 @@ def main() -> None:
             setup_logging(console=console, verbose=False, quiet=True)
         else:
             setup_logging(console=console, verbose=True, quiet=False)
+
+    breadcrumbs = BreadcrumbPublisher(
+        source="drive_setup",
+        endpoint_url=args.alloy_url,
+        enabled=not args.no_telemetry,
+    )
 
     # Mode 1: Scan
     if args.scan or args.unconfigured_only:
@@ -2062,13 +2498,36 @@ def main() -> None:
         else:
             sys.exit(VerifyPresenter.render_table(report, console))
 
-    # Mode 3: Setup Actions
+    # Mode 3: Tune APM
+    if args.tune_apm is not None:
+        if not args.device:
+            ErrorPresenter.render_error(
+                error_code="E_MISSING_DEVICE",
+                message="Target device is required for --tune-apm.",
+                remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
+                console=console,
+                json_mode=json_mode,
+            )
+            if not json_mode:
+                parser.print_help(sys.stderr)
+            sys.exit(1)
+
+        sys.exit(do_tune_apm(
+            device=args.device,
+            target_apm_str=args.tune_apm,
+            assume_yes=args.yes,
+            console=console,
+            breadcrumbs=breadcrumbs,
+            json_mode=json_mode,
+        ))
+
+    # Mode 4: Setup Actions
     has_step = any([args.format, args.mount, args.fstab, args.perms, args.tune_reserve_block, args.all])
     if not has_step:
         ErrorPresenter.render_error(
             error_code="E_MISSING_STAGE",
             message="No setup stage specified.",
-            remediation="Specify a starting stage (-fmt, -mnt, -fst, -p, -trb) or use '-a / --all'.",
+            remediation="Specify a starting stage (-fmt, -mnt, -fst, -p, -trb), '--tune-apm <LEVEL>', or use '-a / --all'.",
             console=console,
             json_mode=json_mode,
         )

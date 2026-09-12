@@ -160,6 +160,12 @@ Reclaim 50–100GB of wasted reserved root blocks on an existing drive (operates
 sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 ```
 
+### 6. Tune HDD Power Management (APM) & Emit Observability Breadcrumb
+Adjust drive power management profile while sending an audit event directly into your Grafana Alloy / Loki observability stack:
+```bash
+sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
+```
+
 ---
 
 ## ⚙️ CLI Reference
@@ -168,13 +174,16 @@ sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 
 | Flag | Long Option | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `-d` | `--device` | Target block device (e.g. `/dev/sdb`, `/dev/sdb1`, `/dev/nvme1n1p1`) | *Required for setup/verify* |
+| `-d` | `--device` | Target block device (e.g. `/dev/sdb`, `/dev/sdb1`, `/dev/nvme1n1p1`) | *Required for setup/verify/apm* |
 | `-m` | `--mountpoint` | Target mount point directory (e.g. `/mnt/storage`) | *Required for setup* |
 | `-l` | `--label` | Filesystem label (used when formatting) | None |
 | `-t` | `--type` | Filesystem type (`ext4`) | `ext4` |
 | `-irt` | `--inode-reserve-type` | Inode ratio profile (`largefile`: 1MB/inode, `largefile4`: 4MB/inode, `default`: 16KB/inode) | `largefile` |
 | `-r` | `--reserved-percent` | Reserved root blocks percentage | `1` |
 | `-u` | `--user` | Mountpoint directory owner user/group | Invoking user (`$SUDO_USER` / `$USER`) |
+| | `--tune-apm` | Tune ATA APM level on rotational HDDs (`128`, `254`, `off`) | None |
+| | `--alloy-url` | HTTP endpoint for Grafana Alloy / Loki push | `http://127.0.0.1:9999` (or `$ALLOY_URL`) |
+| | `--no-telemetry` | Explicitly disable sending event breadcrumbs to Alloy/Loki | `False` |
 | `-y` | `--yes` | Non-interactive mode (skips confirmation prompts) | `False` |
 | `-f` | `--force` | Force operations (override partition protection, remount) | `False` |
 | `-v` | `--verbose` | Enable verbose/debug subprocess logging | `True` |
@@ -189,12 +198,73 @@ sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
 | `-s` | `--scan` | **Discovery Mode:** Scan system storage devices (displays configured and unconfigured) |
 | `-uo` | `--unconfigured-only` | **Filter:** Display only unconfigured / available storage devices (skips configured table) |
 | `-V` | `--verify` | **Audit Mode:** Check device health, mount, fstab, and perms |
+| | `--tune-apm` | **Hardware Tuning:** Adjust ATA APM level on rotational hard drives & emit event |
 | `-fmt` | `--format` | **Stage 1:** Format drive & cascade through all subsequent stages |
 | `-trb` | `--tune-reserve-block` | **Stage 2:** Tune reserved root block percentage (`tune2fs`) & cascade |
 | `-mnt` | `--mount` | **Stage 3:** Mount filesystem & cascade to FSTAB and PERMS |
 | `-fst` | `--fstab` | **Stage 4:** Add persistent UUID entry to `/etc/fstab` & cascade to PERMS |
 | `-p` | `--perms` | **Stage 5:** Set mountpoint ownership and `755` permissions |
 | `-a` | `--all` | Complete pipeline: execute stages 1 through 5 |
+
+---
+
+## ⚡ HDD Power Management (APM) & The Thermal Trade-Off
+
+ATA Advanced Power Management (APM) controls how aggressively rotational hard drives park their heads and enter low-power idle states. In a homelab, APM represents a fundamental trade-off between **mechanical head wear** and **operating temperatures**:
+
+* **APM 254 (Maximum Performance / Heads Loaded)**:
+  - Completely disables head parking and spindown. The heads remain flying over the platters with 0 wake latency and zero SMART `Load_Cycle_Count` incrementing.
+  - **Thermal Penalty**: The voice coil and pre-amplifier electronics remain fully energized, continuously drawing 2–4W more power. In a drive cage with restricted airflow, this can push drive temperatures from **40°C up to 49°C+**, which accelerates motor bearing wear.
+* **APM 128 (Standard Homelab Idle - Recommended for Warm Drives)**:
+  - Spindown is disabled (the spindle motor never stops spinning), but heads are permitted to park to the ramp during prolonged idle according to internal firmware timers.
+  - **Thermal Benefit**: Runs **5°C to 8°C cooler**, keeping operating temperatures within the safe 35°C–42°C longevity window.
+* **APM 1–127**:
+  - Aggressive power saving permitting spindle spindown. Not recommended for 24/7 NAS or media drives due to spin-up latency and spindle motor start/stop cycles.
+
+`drive_setup.py` provides **observational APM telemetry** in `--verify` without forcing changes automatically, and allows targeted, context-aware tuning via `--tune-apm <LEVEL>`.
+
+---
+
+## 📡 Observability & Event Telemetry (Grafana Alloy & Loki)
+
+`drive_setup.py` includes a decoupled **`BreadcrumbPublisher`** gateway that sends structured JSON operational events to **Grafana Alloy** (`loki.source.api`) / Loki.
+
+Whenever an operator changes drive power management via `--tune-apm`, a timestamped event breadcrumb is pushed over HTTP, enabling Grafana to render vertical annotation markers directly over temperature and load cycle graphs.
+
+### 1. Alloy Configuration (`config.river`)
+Declare a `loki.source.api` block in Alloy that feeds into your existing `loki.write` block:
+```river
+loki.source.api "storage_hooks" {
+  http {
+    listen_address = "0.0.0.0"
+    listen_port    = 9999
+  }
+  forward_to = [loki.write.local_loki.receiver]
+  labels = {
+    source = "drive_setup",
+    job    = "storage_ops",
+  }
+}
+```
+
+### 2. Docker Compose Port Mapping
+Ensure Alloy's ingest port is mapped securely to the host:
+```yaml
+services:
+  alloy:
+    image: grafana/alloy:latest
+    ports:
+      - "127.0.0.1:9999:9999"
+    ...
+```
+
+### 3. Grafana Dashboard Annotation Query
+In your Grafana dashboard settings (e.g. over a panel tracking **Temperature vs Head Parking**):
+* **Data Source**: `Loki`
+* **LogQL Query**: `{source="drive_setup", action="apm_tune"}`
+* **Text / Tooltip**: `APM tuned for {{device}}: {{old_apm}} → {{new_apm}}`
+
+Whenever `--tune-apm` is invoked, a vertical dashed event line instantly flags the exact moment of the configuration change on your graphs.
 
 ---
 
