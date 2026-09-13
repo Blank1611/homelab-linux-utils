@@ -14,16 +14,16 @@ It replaces brittle multi-step manual processes (`mkfs`, `tune2fs`, `mkdir`, `mo
 
 - **Idempotent Pre-Flight Action Matrix:** Evaluates current filesystem, mount, fstab, and permission states before executing anything. Skipped actions are highlighted so you never accidentally reformat or duplicate fstab entries.
 - **Cascading Lifecycle Execution:** Trigger any lifecycle stage, and the tool automatically cascades through all subsequent stages:
-  - `FORMAT` ➔ `TUNE_RESERVED` ➔ `MOUNT` ➔ `FSTAB` ➔ `PERMS` (or run `--all`)
+  - `format` ➔ `tune-reserve` ➔ `mount` ➔ `fstab` ➔ `perms` (or run `setup all`)
 - **Storage Space Optimization for Media Drives:**
   - **Inode Ratio Tuning (`-irt`):** Ext4 defaults to 16KB per inode, wasting tens of gigabytes of disk space on inode tables for large media/archive disks. Supports `-irt largefile` (1MB/inode) and `largefile4` (4MB/inode), reclaiming substantial usable capacity.
   - **Reserved Root Block Tuning (`-r`):** Reduces ext4's default 5% root block reservation down to 1% (or custom percentage), recovering 50–100GB+ of usable space on multi-terabyte drives. Can also be applied live to active filesystems.
 - **Smart Partition Resolution:** Automatically disambiguates parent block devices (e.g., `/dev/sdb`) to child partitions (e.g., `/dev/sdb1`) when only one partition exists, preventing false "unformatted" warnings while preserving parent hardware metadata (model, serial, size).
-- **Accidental Wipe Protection:** Multi-partition disks and drives with existing filesystems cannot be formatted without passing `--force`.
+- **Accidental Wipe Protection:** Multi-partition disks and drives with existing filesystems cannot be formatted without passing `--force` (`-f`).
 - **Bulletproof Persistence:** Adds `/etc/fstab` entries by **UUID** (never volatile `/dev/sdX` device names) and creates timestamped backups (`/etc/fstab.bak.<timestamp>`) prior to any modification.
 - **Dynamic Personalization & Caller Resolution:** Automatically personalizes CLI descriptions to the local machine's hostname (`socket.gethostname()`) and defaults directory ownership to the invoking caller (`$SUDO_USER` or current user), with full support for explicit user overrides (`-u / --user`).
 - **Live Output Streaming & Detailed Logging:** Real-time stdout/stderr output streaming for long operations (e.g., `mkfs.ext4` inode allocation and journal creation), complete with ANSI-colored logging and a `-q / --quiet` option.
-- **Audit & Discovery Modes:** Non-destructive system scan (`--scan`) and comprehensive storage audit (`--verify`).
+- **Safety-by-Design Architecture:** Pure read-only discovery (`scan`) and audit (`verify`) at the root level; mutating operations strictly isolated to dedicated subcommands (`setup` and `apm`).
 
 ---
 
@@ -32,7 +32,7 @@ It replaces brittle multi-step manual processes (`mkfs`, `tune2fs`, `mkdir`, `mo
 - Linux (tested on Debian / Ubuntu / Proxmox / modern Linux distributions)
 - Python 3.7+ (uses only Python Standard Library)
 - Standard system utilities: `util-linux` (`lsblk`, `blkid`, `findmnt`, `mount`, `umount`), `e2fsprogs` (`mkfs.ext4`, `tune2fs`)
-- Root privileges (`sudo`) for provisioning operations (auditing/verifying can be run unprivileged)
+- Root privileges (`sudo`) for provisioning and power management operations (discovery scanning and audit verifying can run unprivileged)
 
 ---
 
@@ -43,22 +43,25 @@ Make the script executable:
 chmod +x drive_setup.py
 ```
 
-### 1. Discovery Mode (`--scan` / `-s`, `-uo` / `--unconfigured-only`)
+### 1. Discovery Mode (Default / `-s`, `-uo` / `--unconfigured-only`)
 
-Scans all host block devices to provide an instant inventory of your storage topology without modifying any drives.
+Running `./drive_setup.py` without arguments automatically performs a complete discovery scan across all host block devices without modifying anything.
 
-By default, `--scan` presents two clean, structured sections:
+By default, the scan presents two clean, structured sections:
 1. **Configured & Active Storage Devices:** A compact audit table showing active drives with their filesystem, volume label, mountpoint, `/etc/fstab` persistence, directory owner/permissions, and ext4 efficiency metrics.
 2. **Unconfigured / Available Storage Devices:** Identifies raw, unpartitioned, unmounted, or orphaned storage, complete with tailored setup command recipes.
 
 ```bash
-# Full storage inventory (both configured and unconfigured)
-sudo ./drive_setup.py -s
+# Default storage inventory (both configured and unconfigured)
+./drive_setup.py
+# or explicitly with -s / --scan:
+./drive_setup.py -s
 
 # Display only unconfigured / available devices (skips configured table)
-sudo ./drive_setup.py -uo
-# or
-sudo ./drive_setup.py -s -uo
+./drive_setup.py -uo
+
+# Pure JSON discovery for AI agents or automation:
+./drive_setup.py -j
 ```
 
 Example scan output:
@@ -82,7 +85,7 @@ DEVICE         SIZE     TYPE   MODEL                  FS       STATUS           
 =======================================================================================================================================
 ```
 
-#### What `--scan` Checks:
+#### What Discovery Checks:
 - **Device Topology:** Probes all attached SATA, SAS, USB, and NVMe drives and partitions via `lsblk`.
 - **Partition & Filesystem State:** Identifies whether drives are raw/unpartitioned, formatted, or have missing filesystems.
 - **Mount & Usage Status:** Distinguishes between active, mounted filesystems and orphaned or unmounted storage.
@@ -91,25 +94,25 @@ DEVICE         SIZE     TYPE   MODEL                  FS       STATUS           
 
 ---
 
-### 2. Device Audit Mode (`--verify` / `-V`)
+### 2. Device Audit Mode (`-V` / `--verify`)
 
 Performs a deep, non-destructive health and configuration compliance check on a specific device and target mount point.
 
 ```bash
 ./drive_setup.py -V -d /dev/sdb1 -m /mnt/storage
-# or
-./drive_setup.py --verify -d /dev/sdb1 -m /mnt/storage
+# or with JSON output:
+./drive_setup.py -V -d /dev/sdb1 -m /mnt/storage -j
 ```
 
-#### What `--verify` Checks:
+#### What `-V / --verify` Checks:
 - **Smart Partition Resolution:** Disambiguates parent disks (e.g. `/dev/sdb`) to child partitions (e.g. `/dev/sdb1`), preventing false "unformatted" warnings while verifying hardware model and size.
-- **Filesystem Integrity (`--format`):** Queries `blkid` for filesystem type, volume UUID, and assigned label.
-- **Active Mount Verification (`--mount`):** Verifies active mounts in `/proc/mounts`, detecting if the drive is unmounted or mounted to the wrong directory.
-- **Persistence Verification (`--fstab`):** Validates `/etc/fstab` entries to ensure the device has a permanent, UUID-bound mount point that will survive reboot.
-- **Directory Permissions (`--perms`):** Confirms the mount directory exists, verifies ownership against the expected user (`-u`), and validates standard `755` permissions.
+- **Filesystem Integrity:** Queries `blkid` for filesystem type, volume UUID, and assigned label.
+- **Active Mount Verification:** Verifies active mounts in `/proc/mounts`, detecting if the drive is unmounted or mounted to the wrong directory.
+- **Persistence Verification:** Validates `/etc/fstab` entries to ensure the device has a permanent, UUID-bound mount point that will survive reboot.
+- **Directory Permissions:** Confirms the mount directory exists, verifies ownership against the expected user (`-u`), and validates standard `755` permissions.
 - **Storage Efficiency & Geometry (ext4):**
   - **Inode Allocation & Profile (`-irt`):** Inspects total vs. free inodes, calculates exact inode table overhead in MB/GB, and identifies active profile (`largefile`, `largefile4`, `default`).
-  - **Reserved Root Block Allocation (`-trb` / `-r`):** Checks reserved block percentage via `tune2fs`, highlighting reclaimed storage or flagging when ext4's default 5% allocation is wasting tens of gigabytes.
+  - **Reserved Root Block Allocation (`-r`):** Checks reserved block percentage via `tune2fs`, highlighting reclaimed storage or flagging when ext4's default 5% allocation is wasting tens of gigabytes.
 
 #### Example Audit Output:
 ```text
@@ -121,93 +124,122 @@ Target Mountpoint: /mnt/storage
 Target Owner:      <username>
 ----------------------------------------------------------------------
 COMPONENT AUDIT:
-  [✓] Filesystem (--format):       ext4 | UUID: 12345678-abcd-ef01-2345-6789abcdef01 | Label (-l): "storage_pool"
-  [✓] Active Mount (--mount):      Mounted at /mnt/storage (-m)
-  [✓] Persistence (--fstab):       Valid persistent entry found in /etc/fstab for /mnt/storage
-  [✓] Permissions (--perms):       Directory exists | Owner (-u): <username> | Perms: 755
+  [✓] Filesystem (format):         ext4 | UUID: 12345678-abcd-ef01-2345-6789abcdef01 | Label (-l): "storage_pool"
+  [✓] Active Mount (mount):        Mounted at /mnt/storage (-m)
+  [✓] Persistence (fstab):         Valid persistent entry found in /etc/fstab for /mnt/storage
+  [✓] Permissions (perms):         Directory exists | Owner (-u): <username> | Perms: 755
 ----------------------------------------------------------------------
 STORAGE EFFICIENCY & ALLOCATION:
   Inodes (-irt):                   122,093,568 total (4,148 used, 122,089,420 free) [Profile: default] | Table Overhead: 29.11 GB
-  Reserved Space (-trb / -r):      1.0% (18.6 GB reserved for root) [Tool Target: 1%]
+  Reserved Space (-r):             1.0% (18.6 GB reserved for root) [Tool Target: 1%]
 ----------------------------------------------------------------------
 ✓ AUDIT RESULT: Storage setup is complete, healthy, and persistent!
 No setup actions required.
 ======================================================================
 ```
 
-### 3. Provision a New Media Drive From Scratch
+### 3. Provision a New Media Drive From Scratch (`setup all`)
 Format a drive with media inode optimizations, tune reserved space to 1%, mount to `/mnt/storage`, persist to `/etc/fstab`, and set standard `755` ownership (automatically defaults to your active user):
 ```bash
-sudo ./drive_setup.py -d /dev/sdb1 \
+sudo ./drive_setup.py setup all \
+  -d /dev/sdb1 \
   -m /mnt/storage \
   -l "storage_pool" \
   -irt largefile \
-  -r 1 \
-  -fmt
+  -r 1
 ```
-*(Passing `-fmt` automatically cascades through Format ➔ Tune ➔ Mount ➔ Fstab ➔ Permissions).*
 
-### 4. Mount & Persist an Already Formatted Drive
+### 4. Format & Cascade (`setup format`)
+Format a partition with `largefile` inodes and let it cascade into mount, fstab, and permissions:
+```bash
+sudo ./drive_setup.py setup format -d /dev/sdb1 -m /mnt/storage -l "storage_pool" -irt largefile
+```
+*(Pass `--no-cascade` if you only want to format the partition without mounting).*
+
+### 5. Mount & Persist an Already Formatted Drive (`setup mount`)
 If your drive already has a filesystem and data, mount it and establish persistence without reformatting:
 ```bash
-sudo ./drive_setup.py -d /dev/sdb1 -m /mnt/storage -mnt
+sudo ./drive_setup.py setup mount -d /dev/sdb1 -m /mnt/storage
 ```
 *(Cascades through Mount ➔ Fstab ➔ Permissions).*
 
-### 5. Tune Reserved Root Blocks on an Active Ext4 Drive
+### 6. Tune Reserved Root Blocks on an Active Ext4 Drive (`setup tune-reserve`)
 Reclaim 50–100GB of wasted reserved root blocks on an existing drive (operates online, no unmount required):
 ```bash
-sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
+sudo ./drive_setup.py setup tune-reserve -d /dev/sdb1 -r 1
 ```
 
-### 6. Tune HDD Power Management (APM) & Emit Observability Breadcrumb
-Adjust drive power management profile while sending an audit event directly into your Grafana Alloy / Loki observability stack:
+### 7. Tune HDD Power Management (`apm`) & Emit Observability Breadcrumb
+Adjust drive power management profile with persistent udev rules and automatic Loki telemetry:
 ```bash
-sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
+sudo ./drive_setup.py apm -d /dev/sdb -l 128 -r
 ```
 
 ---
 
 ## ⚙️ CLI Reference
 
-### Setup Options
+### 1. Global Options (Available Across Root and All Subcommands)
 
 | Flag | Long Option | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `-d` | `--device` | Target block device (e.g. `/dev/sdb`, `/dev/sdb1`, `/dev/nvme1n1p1`) | *Required for setup/verify/apm* |
-| `-m` | `--mountpoint` | Target mount point directory (e.g. `/mnt/storage`) | *Required for setup* |
-| `-l` | `--label` | Filesystem label (used when formatting) | None |
-| `-t` | `--type` | Filesystem type (`ext4`) | `ext4` |
-| `-irt` | `--inode-reserve-type` | Inode ratio profile (`largefile`: 1MB/inode, `largefile4`: 4MB/inode, `default`: 16KB/inode) | `largefile` |
-| `-r` | `--reserved-percent` | Reserved root blocks percentage | `1` |
-| `-u` | `--user` | Mountpoint directory owner user/group | Invoking user (`$SUDO_USER` / `$USER`) |
-| | `--tune-apm` | Tune ATA APM level on rotational HDDs (`128`, `254`, `off`) | None |
-| | `--no-persist-apm` | Disable writing persistent udev rule when tuning APM (runtime-only modification) | `False` |
-| | `--udev-match` | Udev matching strategy for APM persistence (`drive` or `uuid`) | `drive` |
-| | `--reload-udev` | Reload and trigger udev rules (standalone or with `--tune-apm`) | `False` |
-| | `--alloy-url` | HTTP endpoint for Grafana Alloy / Loki push | `http://127.0.0.1:9999` (or `$ALLOY_URL`) |
-| | `--no-telemetry` | Explicitly disable sending event breadcrumbs to Alloy/Loki | `False` |
-| `-y` | `--yes` | Non-interactive mode (skips confirmation prompts) | `False` |
-| `-f` | `--force` | Force operations (override partition protection, remount) | `False` |
+| `-j` | `--json` | Output pure structured JSON payload on stdout (for AI agents & scripts) | `False` |
 | `-v` | `--verbose` | Enable verbose/debug subprocess logging | `True` |
 | `-q` | `--quiet` | Quiet mode: suppress debug command logs and subprocess output | `False` |
-| `--color` | | Color mode: `auto` (default, TTY/NO_COLOR detected), `always`, `never` | `auto` |
-| | `--json` | Output pure structured JSON payload on stdout (for AI agents & scripts) | `False` |
+| `-c` | `--color` | Color mode: `auto` (default, TTY/NO_COLOR detected), `always`, `never` | `auto` |
+| `-N` | `--no-telemetry` | Explicitly disable sending event breadcrumbs to Alloy/Loki | `False` |
+| `-U` | `--alloy-url` | HTTP endpoint for Grafana Alloy / Loki push | `http://127.0.0.1:9999` (or `$ALLOY_URL`) |
 
-### Modes & Stages
+---
 
-| Flag | Long Option | Description |
-| :--- | :--- | :--- |
-| `-s` | `--scan` | **Discovery Mode:** Scan system storage devices (displays configured and unconfigured) |
-| `-uo` | `--unconfigured-only` | **Filter:** Display only unconfigured / available storage devices (skips configured table) |
-| `-V` | `--verify` | **Audit Mode:** Check device health, mount, fstab, and perms |
-| | `--tune-apm` | **Hardware Tuning:** Adjust ATA APM level on rotational hard drives & emit event |
-| `-fmt` | `--format` | **Stage 1:** Format drive & cascade through all subsequent stages |
-| `-trb` | `--tune-reserve-block` | **Stage 2:** Tune reserved root block percentage (`tune2fs`) & cascade |
-| `-mnt` | `--mount` | **Stage 3:** Mount filesystem & cascade to FSTAB and PERMS |
-| `-fst` | `--fstab` | **Stage 4:** Add persistent UUID entry to `/etc/fstab` & cascade to PERMS |
-| `-p` | `--perms` | **Stage 5:** Set mountpoint ownership and `755` permissions |
-| `-a` | `--all` | Complete pipeline: execute stages 1 through 5 |
+### 2. Root Audit & Discovery Options
+
+| Flag | Long Option | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `-s` | `--scan` | **Discovery Scan:** Scan system storage devices (displays configured and unconfigured; **default action**) | `True` if no args |
+| `-uo` | `--unconfigured-only` | **Scan Filter:** Display only unconfigured / available storage devices | `False` |
+| `-V` | `--verify` | **Audit Mode:** Check device health, active mount, fstab persistence, and directory ownership | `False` |
+| `-d` | `--device` | Target block device or partition for verification (e.g. `-d /dev/sdb1`) | Required for `-V` |
+| `-m` | `--mountpoint` | Target mount point directory for verification (e.g. `-m /mnt/storage`) | Optional |
+| `-u` | `--user` | Expected mountpoint directory owner for verification | Invoking user |
+| | `--reload-udev` | Standalone reload and trigger of udev rules via `udevadm` | `False` |
+
+---
+
+### 3. Dedicated Power Management Subcommand: `apm`
+
+```bash
+sudo ./drive_setup.py apm -d <device> -l <level> [-n] [-M {drive,uuid}] [-r] [-y]
+```
+
+| Flag | Long Option | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `-d` | `--device` | Target block device or child partition (e.g. `/dev/sdb` or `/dev/sdb1`) | *Required* |
+| `-l` | `--level` | Target APM level (`128`: balanced, `254`: performance/no-parking, `off`/`255`: disabled) | *Required* |
+| `-n` | `--no-persist` | Disable writing persistent udev rule (transient runtime modification only) | `False` |
+| `-M` | `--match` | Udev matching strategy for persistence (`drive` or `uuid`) | `drive` |
+| `-r` | `--reload-udev` | Trigger `udevadm control --reload-rules && udevadm trigger` immediately | `False` |
+| `-y` | `--yes` | Skip interactive confirmation prompts | `False` |
+| `-f` | `--force` | Force APM update even if drive reports existing level | `False` |
+
+---
+
+### 4. Dedicated Storage Provisioning Subcommand: `setup` (alias: `provision`)
+
+```bash
+sudo ./drive_setup.py setup <stage> [options]
+```
+
+#### Stage Summary & Arguments:
+
+| Stage | Required Flags | Optional Flags | Description & Cascading Flow |
+| :--- | :--- | :--- | :--- |
+| **`all`** | `-d <dev>`, `-m <path>`, `-l <label>` | `-t`, `-irt`, `-r`, `-u`, `-y`, `-f` | Complete pipeline: Format ➔ Tune ➔ Mount ➔ Fstab ➔ Perms |
+| **`format`** | `-d <dev>`, `-l <label>` | `-m`, `-u`, `-t`, `-irt`, `-r`, `--no-cascade` | Format filesystem; cascades to tune/mount/fstab/perms if `-m` provided |
+| **`tune-reserve`**| `-d <dev>`, `-r <pct>` | `-m`, `--no-cascade` | Tune ext4 reserved root blocks (online/offline); cascades if `-m` provided |
+| **`mount`** | `-d <dev>`, `-m <path>` | `-u`, `--no-cascade` | Mount drive and cascade through Fstab and Perms |
+| **`fstab`** | `-d <dev>`, `-m <path>` | `-u`, `--no-cascade` | Configure `/etc/fstab` persistent UUID entry and cascade to Perms |
+| **`perms`** | `-m <path>` | `-d <dev>`, `-u <user>` | Set mount point ownership and standard `755` permissions |
 
 ---
 
@@ -225,14 +257,15 @@ ATA Advanced Power Management (APM) controls how aggressively rotational hard dr
   - Aggressive power saving permitting spindle spindown. Not recommended for 24/7 NAS or media drives due to spin-up latency and spindle motor start/stop cycles.
 
 ### 🛡️ Automated Udev Persistence (`/etc/udev/rules.d/69-hdparm-apm.rules`)
-By default, running `--tune-apm <LEVEL>` automatically creates or updates persistent rules in `/etc/udev/rules.d/69-hdparm-apm.rules` so settings survive server reboots:
+By default, running `sudo ./drive_setup.py apm -d <device> -l <level>` automatically creates or updates persistent rules in `/etc/udev/rules.d/69-hdparm-apm.rules` so settings survive server reboots:
 
-* **Default-On Persistence**: Automatically writes the rule unless you explicitly pass `--no-persist-apm` for transient runtime sessions.
-* **Udev Matching Strategies (`--udev-match {drive,uuid}`)**:
-  - **`--udev-match drive` (Default)**: Generates a kernel device name rule (`KERNEL=="sdX"`). As a safety guardrail, `drive_setup.py` checks that the drive has an active entry in `/etc/fstab` before writing this rule. If missing, it fails fast to protect you from drive-letter swap issues across reboots.
-  - **`--udev-match uuid`**: Binds the rule to the filesystem UUID (`ENV{ID_FS_UUID}=="<UUID>"`), completely immune to drive-letter shifts across USB ports or SATA controllers.
-* **Decoupled Udev Reloading (`--reload-udev`)**:
-  - Pass `--reload-udev` to trigger `udevadm control --reload-rules && udevadm trigger` immediately.
+* **Default-On Persistence**: Automatically writes the rule unless you explicitly pass `-n / --no-persist` for transient runtime sessions.
+* **Udev Matching Strategies (`-M / --match {drive,uuid}`)**:
+  - **`-M drive` (Default)**: Generates a kernel device name rule (`KERNEL=="sdX"`). As a safety guardrail, `drive_setup.py` checks that the drive has an active entry in `/etc/fstab` before writing this rule. If missing, it fails fast to protect you from drive-letter swap issues across reboots.
+  - **`-M uuid`**: Binds the rule to the filesystem UUID (`ENV{ID_FS_UUID}=="<UUID>"`), completely immune to drive-letter shifts across USB ports or SATA controllers.
+* **Decoupled Udev Reloading (`-r / --reload-udev`)**:
+  - Pass `-r / --reload-udev` with `apm` to trigger `udevadm control --reload-rules && udevadm trigger` immediately.
+  - Can also be executed standalone: `sudo ./drive_setup.py apm -r` or `sudo ./drive_setup.py --reload-udev`.
   - In interactive mode, prompts whether to reload now (`[Y/n]`).
   - In non-interactive or JSON mode, emits a pending notice with the exact reload command.
   - Can also be executed standalone: `sudo ./drive_setup.py --reload-udev`.
@@ -287,15 +320,15 @@ Observation breadcrumbs emitted during `--verify` and `--scan` stream self-docum
 
 | Event Domain (`event`) | Action (`action`) | Trigger / Operation | Indexed Labels |
 | :--- | :--- | :--- | :--- |
-| `storage_audit` | `scan` | System-wide block device discovery (`--scan`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_audit` | `verify` | Mountpoint and persistence audit (`--verify`) | `source`, `event`, `action`, `level`, `device` |
-| `hardware_tune` | `apm_tune` | ATA APM power level tuned (`--tune-apm`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `format` | Ext4 filesystem creation (`--format`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `tune_reserve` | Root reserved block tuning (`-trb`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `mount` | Filesystem mount (`--mount`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `fstab` | `/etc/fstab` persistence update (`--fstab`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `permissions` | Directory chown / chmod (`--perms`) | `source`, `event`, `action`, `level`, `device` |
-| `storage_provision` | `setup_all` | End-to-end cascading setup pipeline (`--all`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_audit` | `scan` | System-wide block device discovery (`./drive_setup.py` / `-s`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_audit` | `verify` | Mountpoint and persistence audit (`-V / --verify`) | `source`, `event`, `action`, `level`, `device` |
+| `hardware_tune` | `apm_tune` | ATA APM power level tuned (`apm -l <level>`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `format` | Ext4 filesystem creation (`setup format`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `tune_reserve` | Root reserved block tuning (`setup tune-reserve`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `mount` | Filesystem mount (`setup mount`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `fstab` | `/etc/fstab` persistence update (`setup fstab`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `permissions` | Directory chown / chmod (`setup perms`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `setup_all` | End-to-end cascading setup pipeline (`setup all`) | `source`, `event`, `action`, `level`, `device` |
 
 ### 2. Alloy Configuration (`config.river`)
 Declare a `loki.source.api` block in Alloy that feeds into your existing `loki.write` block:
@@ -336,8 +369,8 @@ services:
 
 `drive_setup.py` is purpose-built for both terminal-native AI agents (e.g. Antigravity, Claude Code, Cursor, terminal subagents) and traditional CI/CD / headless automation:
 
-### 1. Pure Structured JSON Mode (`--json`)
-When passing `--json`, the tool guarantees that `sys.stdout` contains **100% pure, parseable JSON** with standard 2-space indentation.
+### 1. Pure Structured JSON Mode (`-j / --json`)
+When passing `-j` / `--json`, the tool guarantees that `sys.stdout` contains **100% pure, parseable JSON** with standard 2-space indentation.
 - **Human logs & subprocess traces are directed to `sys.stderr`**, keeping the JSON stream uncorrupted.
 - Standard JSON schema includes `"status"`, `"mode"`, detailed component states, and actionable suggestions.
 - On errors, standard structured error envelopes are emitted with remediation:
@@ -370,13 +403,13 @@ When passing `--json`, the tool guarantees that `sys.stdout` contains **100% pur
 ### Agent Examples
 ```bash
 # Agent discovers unconfigured storage and parses via jq
-drive=$(./drive_setup.py --scan --json | jq -r '.unconfigured_devices[0].device // empty')
+drive=$(./drive_setup.py -j | jq -r '.unconfigured_devices[0].device // empty')
 
 # Agent runs audit on discovered drive
-./drive_setup.py -V -d "$drive" -m /mnt/storage --json
+./drive_setup.py -V -d "$drive" -m /mnt/storage -j
 
 # Agent safely executes full provisioning non-interactively
-sudo ./drive_setup.py -d "$drive" -m /mnt/storage -l "storage_pool" -fmt -y --json
+sudo ./drive_setup.py setup all -d "$drive" -m /mnt/storage -l "storage_pool" -y -j
 ```
 
 ---

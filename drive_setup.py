@@ -407,12 +407,12 @@ class BreadcrumbPublisher:
 
         # 3. Fail-Safe HTTP Transport
         target_url = f"{self.endpoint_url.rstrip('/')}/loki/api/v1/push"
-        compact_payload = json.dumps(enriched_data)
-        logger.info(f"Publishing crumb to {target_url}: {compact_payload}")
+        serialized_body = json.dumps(body)
+        logger.info(f"Publishing crumb to {target_url}: {serialized_body}")
         try:
             req = urllib.request.Request(
                 target_url,
-                data=json.dumps(body).encode("utf-8"),
+                data=serialized_body.encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -1088,7 +1088,7 @@ class DeviceInspector:
             state.mountpoint_exists = mp_path.exists() and mp_path.is_dir()
             if state.mountpoint_exists:
                 try:
-                    findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", effective_mp])
+                    findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-M", effective_mp])
                     if findmnt.returncode == 0 and findmnt.stdout.strip():
                         state.mountpoint_is_mounted = True
                         state.mountpoint_active_src = findmnt.stdout.strip()
@@ -1876,7 +1876,7 @@ def step_mount(
         mp_path.mkdir(parents=True, exist_ok=True)
 
         # Check if already mounted
-        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint], console=con)
+        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-M", mountpoint], console=con)
         if findmnt.returncode == 0 and findmnt.stdout.strip():
             src = findmnt.stdout.strip()
             if src == device or os.path.realpath(src) == os.path.realpath(device):
@@ -1956,7 +1956,7 @@ def step_permissions(
     act = f"Set ownership and permissions on {mountpoint} for {username}"
 
     if confirm(exp, act, cmd=perm_cmd, assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="PERMS"):
-        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-T", mountpoint], console=con)
+        findmnt = run_cmd(["findmnt", "-no", "SOURCE", "-M", mountpoint], console=con)
         if findmnt.returncode != 0 or not findmnt.stdout.strip():
             logger.error(f"Mount point '{mountpoint}' is not currently active.")
             logger.error("Please mount the drive first before applying permissions.")
@@ -2063,17 +2063,35 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
         )
         sys.exit(1)
 
-    input_device = args.device
-    mountpoint = args.mountpoint
-    label = args.label
+    stage = getattr(args, "stage", "all")
+    no_cascade = getattr(args, "no_cascade", False)
+    input_device = getattr(args, "device", None)
+    mountpoint = getattr(args, "mountpoint", None)
+    label = getattr(args, "label", None)
     fstype = getattr(args, "type", "ext4") or "ext4"
     inode_reserve_type = getattr(args, "inode_reserve_type", "largefile") or "largefile"
     reserved_percent = getattr(args, "reserved_percent", 1)
     if reserved_percent is None:
         reserved_percent = 1
-    username = args.user
-    force = args.force
-    assume_yes = args.yes
+    username = getattr(args, "user", None) or get_default_user()
+    force = getattr(args, "force", False)
+    assume_yes = getattr(args, "yes", False)
+
+    # If stage is perms and no device specified, resolve from mountpoint if mounted
+    if stage == "perms" and not input_device and mountpoint:
+        res = run_cmd(["findmnt", "-no", "SOURCE", "-M", mountpoint])
+        if res.returncode == 0 and res.stdout.strip():
+            input_device = res.stdout.strip()
+
+    if not input_device:
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_DEVICE",
+            message="Target device could not be determined. Please specify with '-d <device>'.",
+            remediation=f"sudo ./drive_setup.py setup {stage} -d /dev/sdb1 -m {mountpoint or '/mnt/storage'}",
+            console=console,
+            json_mode=json_mode,
+        )
+        sys.exit(1)
 
     # 1. Determine cascading stages
     do_format = False
@@ -2082,29 +2100,48 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
     do_fstab = False
     do_perms = False
 
-    only_tuning = getattr(args, "tune_reserve_block", False) and not any([args.format, args.mount, args.fstab, args.perms, args.all])
-
-    if args.all or args.format:
+    if stage == "all":
         do_format = True
         do_tune = True
         do_mount = True
         do_fstab = True
         do_perms = True
-    elif args.tune_reserve_block:
+    elif stage == "format":
+        do_format = True
+        if not no_cascade:
+            do_tune = True
+            if mountpoint:
+                do_mount = True
+                do_fstab = True
+                do_perms = True
+    elif stage == "tune-reserve":
         do_tune = True
-        do_mount = not only_tuning
-        do_fstab = not only_tuning
-        do_perms = not only_tuning
-    elif args.mount:
-        do_tune = True
+        if not no_cascade and mountpoint:
+            do_mount = True
+            do_fstab = True
+            do_perms = True
+    elif stage == "mount":
         do_mount = True
+        if not no_cascade:
+            do_tune = True
+            do_fstab = True
+            do_perms = True
+    elif stage == "fstab":
         do_fstab = True
+        if not no_cascade:
+            do_perms = True
+    elif stage == "perms":
         do_perms = True
-    elif args.fstab:
-        do_fstab = True
-        do_perms = True
-    elif args.perms:
-        do_perms = True
+
+    if do_mount and not mountpoint:
+        ErrorPresenter.render_error(
+            error_code="E_MISSING_MOUNTPOINT",
+            message="Target mount point directory is required for mount/fstab/perms stages.",
+            remediation="Specify mount point using '-m <path>' (e.g. -m /mnt/storage).",
+            console=console,
+            json_mode=json_mode,
+        )
+        sys.exit(1)
 
     # 2. Inspect current device state (with smart partition resolution)
     state = DeviceInspector.inspect(input_device, mountpoint, username)
@@ -2146,7 +2183,7 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
         if not is_already_target and not force:
             dev_profile_str = f" | Inode Profile: {detected_profile}" if state.fstype == "ext4" else ""
             target_profile_str = f" | Inode Profile: {inode_reserve_type}" if fstype == "ext4" else ""
-            cmd_suggestion = f"sudo ./drive_setup.py -d {input_device} -m {mountpoint} -l \"{label}\" -t {fstype} -irt {inode_reserve_type} -r {reserved_percent} -fmt -f"
+            cmd_suggestion = f"sudo ./drive_setup.py setup format -d {input_device} -m {mountpoint or '/mnt/storage'} -l \"{label}\" -t {fstype} -irt {inode_reserve_type} -r {reserved_percent} -f"
             ErrorPresenter.render_error(
                 error_code="E_ACTIVE_FILESYSTEM",
                 message=f"Target device '{input_device}' already contains an active filesystem ({state.fstype}, Label: {state.label or 'none'}{dev_profile_str}). Reformatting will permanently destroy all existing contents.",
@@ -2160,8 +2197,8 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
     if do_mount and not do_format and not state.is_formatted:
         ErrorPresenter.render_error(
             error_code="E_UNFORMATTED_DRIVE",
-            message=f"Prerequisite check failed for '--mount': Device '{device}' has no recognizable filesystem (unformatted).",
-            remediation=f"sudo ./drive_setup.py -d {device} -m {mountpoint} -l <label> -t {fstype} --format",
+            message=f"Prerequisite check failed for 'mount': Device '{device}' has no recognizable filesystem (unformatted).",
+            remediation=f"sudo ./drive_setup.py setup format -d {device} -m {mountpoint} -l <label> -t {fstype}",
             console=console,
             json_mode=json_mode,
         )
@@ -2170,8 +2207,8 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
     if do_fstab and not do_format and not state.is_formatted:
         ErrorPresenter.render_error(
             error_code="E_UNFORMATTED_DRIVE",
-            message=f"Prerequisite check failed for '--fstab': Device '{device}' is unformatted and has no UUID.",
-            remediation=f"sudo ./drive_setup.py -d {device} -m {mountpoint} -l <label> -t {fstype} --format",
+            message=f"Prerequisite check failed for 'fstab': Device '{device}' is unformatted and has no UUID.",
+            remediation=f"sudo ./drive_setup.py setup format -d {device} -m {mountpoint} -l <label> -t {fstype}",
             console=console,
             json_mode=json_mode,
         )
@@ -2180,7 +2217,7 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
     if do_perms and not do_mount and not state.mountpoint_is_mounted:
         ErrorPresenter.render_error(
             error_code="E_MOUNTPOINT_NOT_MOUNTED",
-            message=f"Prerequisite check failed for '--perms': Target mount point '{mountpoint}' is not actively mounted.",
+            message=f"Prerequisite check failed for 'perms': Target mount point '{mountpoint}' is not actively mounted.",
             remediation="Mount the drive first before applying permissions.",
             console=console,
             json_mode=json_mode,
@@ -2191,7 +2228,7 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
         if not state.is_formatted or state.fstype != "ext4":
             ErrorPresenter.render_error(
                 error_code="E_NOT_EXT4",
-                message=f"Prerequisite check failed for '--tune-reserve-block': Device '{device}' is not ext4 (current: {state.fstype or 'unformatted'}).",
+                message=f"Prerequisite check failed for 'tune-reserve': Device '{device}' is not ext4 (current: {state.fstype or 'unformatted'}).",
                 remediation="tune2fs reserved block tuning is only supported on ext4 filesystems.",
                 console=console,
                 json_mode=json_mode,
@@ -2725,64 +2762,157 @@ def do_tune_apm(
 def create_parser() -> argparse.ArgumentParser:
     current_host = socket.gethostname()
     default_user = get_default_user()
+
+    # 1. Reusable Parent Parsers
+    global_parent = argparse.ArgumentParser(add_help=False)
+    global_parent.add_argument("-j", "--json", action="store_true", help="Output results as structured JSON (for AI agents and automation)")
+    global_parent.add_argument("-v", "--verbose", action="store_true", default=True, help="Enable verbose debug logging (default: True)")
+    global_parent.add_argument("-q", "--quiet", action="store_true", help="Quiet mode: suppress debug command logs and execution output")
+    global_parent.add_argument("-c", "--color", choices=["auto", "always", "never"], default="auto", help="Color output mode (auto: detected via TTY/NO_COLOR, always, never)")
+    global_parent.add_argument("-N", "--no-telemetry", action="store_true", help="Disable sending event breadcrumbs to Alloy/Loki")
+    global_parent.add_argument("-U", "--alloy-url", default=os.getenv("ALLOY_URL", "http://127.0.0.1:9999"), help="HTTP endpoint for Grafana Alloy / Loki push (default: http://127.0.0.1:9999 or ALLOY_URL env var)")
+
+    device_parent = argparse.ArgumentParser(add_help=False)
+    device_parent.add_argument("-d", "--device", required=True, help="Target block device (e.g., /dev/sdb, /dev/sdb1, /dev/nvme1n1p1)")
+
+    device_opt_parent = argparse.ArgumentParser(add_help=False)
+    device_opt_parent.add_argument("-d", "--device", required=False, help="Target block device (e.g., /dev/sdb, /dev/sdb1, /dev/nvme1n1p1)")
+
+    mount_parent = argparse.ArgumentParser(add_help=False)
+    mount_parent.add_argument("-m", "--mountpoint", required=True, help="Target mount point directory (e.g., /mnt/storage)")
+
+    mount_opt_parent = argparse.ArgumentParser(add_help=False)
+    mount_opt_parent.add_argument("-m", "--mountpoint", required=False, help="Target mount point directory (e.g., /mnt/storage)")
+
+    user_parent = argparse.ArgumentParser(add_help=False)
+    user_parent.add_argument("-u", "--user", default=default_user, help=f"User who will own the mount point (default: {default_user})")
+
+    prompt_parent = argparse.ArgumentParser(add_help=False)
+    prompt_parent.add_argument("-y", "--yes", action="store_true", help="Skip interactive confirmation prompts")
+    prompt_parent.add_argument("-f", "--force", action="store_true", help="Force operations (override data protection and remount)")
+
+    # 2. Root Parser (Defaults to Scan)
     parser = argparse.ArgumentParser(
         prog="drive_setup.py",
-        description=f"Homelab Storage Setup & Provisioning Tool for {current_host}",
+        description=f"Homelab Storage Setup & Provisioning Tool for {current_host}\n(Running without subcommand defaults to system storage discovery scan)",
         formatter_class=argparse.RawTextHelpFormatter,
+        parents=[global_parent],
     )
 
-    setup_group = parser.add_argument_group("Setup Options")
-    setup_group.add_argument("-d", "--device", help="Target block device (e.g., /dev/sdb, /dev/sdb1, /dev/nvme1n1p1)")
-    setup_group.add_argument("-m", "--mountpoint", help="Target mount point directory (e.g., /mnt/storage)")
-    setup_group.add_argument("-l", "--label", help="Filesystem label for formatting (required for --format)")
-    setup_group.add_argument("-t", "--type", default="ext4", help="Target filesystem type for formatting (default: ext4)")
-    setup_group.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage (largefile: 1MB/inode, largefile4: 4MB/inode, default: 16KB/inode)")
-    setup_group.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1, homelab media standard)")
-    setup_group.add_argument("-u", "--user", default=default_user, help=f"User who will own the mount point (default: {default_user})")
-    setup_group.add_argument("--tune-apm", help="Tune ATA Advanced Power Management level on rotational HDDs (e.g. 128, 254, off)")
-    setup_group.add_argument("--no-persist-apm", action="store_true", help="Disable writing persistent udev rule when tuning APM (runtime-only modification)")
-    setup_group.add_argument("--udev-match", choices=["drive", "uuid"], default="drive", help="Udev rule matching strategy for APM persistence (default: drive, requires fstab entry)")
-    setup_group.add_argument("--reload-udev", action="store_true", help="Reload and trigger udev rules (can be used standalone or with --tune-apm)")
-    setup_group.add_argument("--alloy-url", default=os.getenv("ALLOY_URL", "http://127.0.0.1:9999"), help="HTTP endpoint for Grafana Alloy / Loki push (default: http://127.0.0.1:9999 or ALLOY_URL env var)")
-    setup_group.add_argument("--no-telemetry", action="store_true", help="Disable sending event breadcrumbs to Alloy/Loki")
-    setup_group.add_argument("-y", "--yes", action="store_true", help="Skip interactive confirmation prompts")
-    setup_group.add_argument("-f", "--force", action="store_true", help="Force operations (override data protection and remount)")
-    setup_group.add_argument("-v", "--verbose", action="store_true", default=True, help="Enable verbose debug logging (default: True)")
-    setup_group.add_argument("-q", "--quiet", action="store_true", help="Quiet mode: suppress debug command logs and execution output")
-    setup_group.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="Color output mode (auto: detected via TTY/NO_COLOR, always, never)")
+    root_group = parser.add_argument_group("Audit & Discovery Options (Root)")
+    root_group.add_argument("-s", "--scan", action="store_true", help="Scan system storage devices (displays configured and unconfigured; default action)")
+    root_group.add_argument("-uo", "--unconfigured-only", action="store_true", help="When scanning, only display unconfigured / available storage devices")
+    root_group.add_argument("-V", "--verify", action="store_true", help="Inspect and verify the setup status of a drive without modifying anything")
+    root_group.add_argument("-d", "--device", help="Target block device for verification (e.g. -d /dev/sdb1)")
+    root_group.add_argument("-m", "--mountpoint", help="Target mount point directory for verification (e.g. -m /mnt/storage)")
+    root_group.add_argument("-u", "--user", default=default_user, help=f"Expected owner for verification (default: {default_user})")
+    root_group.add_argument("--reload-udev", action="store_true", help="Reload and trigger udev rules via udevadm")
 
-    mode_group = parser.add_argument_group("Audit & Discovery Modes")
-    mode_group.add_argument("-V", "--verify", action="store_true", help="Inspect and verify the setup status of a drive without modifying anything")
-    mode_group.add_argument("-s", "--scan", action="store_true", help="Scan system storage devices (displays configured and unconfigured)")
-    mode_group.add_argument("-uo", "--unconfigured-only", action="store_true", help="When scanning, only display unconfigured / available storage devices (skips configured table)")
-    mode_group.add_argument("--json", action="store_true", help="Output results as structured JSON (for AI agents and automation)")
+    # 3. Subparsers
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
 
-    steps_group = parser.add_argument_group("Setup Stages (Cascading Lifecycle)")
-    steps_group.add_argument("-fmt", "--format", action="store_true", help="Stage 1: Format drive (with inode profile & reserved blocks) and cascade through all stages")
-    steps_group.add_argument("-trb", "--tune-reserve-block", action="store_true", help="Stage 2: Tune filesystem reserved root block percentage via tune2fs (online/offline) and cascade")
-    steps_group.add_argument("-mnt", "--mount", action="store_true", help="Stage 3: Mount drive and cascade through FSTAB and PERMS")
-    steps_group.add_argument("-fst", "--fstab", action="store_true", help="Stage 4: Configure /etc/fstab persistence and cascade to PERMS")
-    steps_group.add_argument("-p", "--perms", action="store_true", help="Stage 5: Set mount point directory ownership and standard permissions (755)")
-    steps_group.add_argument("-a", "--all", action="store_true", help="Complete pipeline: execute all stages from format through permissions")
+    # --- APM Subcommand ---
+    apm_parser = subparsers.add_parser(
+        "apm",
+        parents=[prompt_parent, global_parent],
+        help="Tune ATA Advanced Power Management level on rotational HDDs",
+        description="Tune ATA Advanced Power Management (APM) on rotational hard drives with persistent udev rules and breadcrumb telemetry.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    apm_parser.add_argument("-d", "--device", help="Target block device or partition (e.g. /dev/sdb or /dev/sdb1)")
+    apm_parser.add_argument("-l", "--level", help="Target APM level: 128 (balanced parking), 254 (performance / no parking), off/255 (disabled)")
+    apm_parser.add_argument("-n", "--no-persist", action="store_true", help="Disable writing persistent udev rule (runtime-only modification)")
+    apm_parser.add_argument("-M", "--match", choices=["drive", "uuid"], default="drive", help="Udev rule matching strategy for persistence (default: drive)")
+    apm_parser.add_argument("-r", "--reload-udev", action="store_true", help="Reload and trigger udev rules via udevadm (can run standalone with: apm -r)")
+
+    # --- Setup Subcommand (alias: provision) ---
+    setup_parser = subparsers.add_parser(
+        "setup",
+        aliases=["provision"],
+        help="Provision storage through stage-tailored cascading lifecycle subcommands",
+        description="Provision storage devices through structured lifecycle stages (all, format, tune-reserve, mount, fstab, perms).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    setup_subparsers = setup_parser.add_subparsers(dest="stage", metavar="<stage>")
+
+    # Stage: all
+    p_all = setup_subparsers.add_parser(
+        "all",
+        parents=[device_parent, mount_parent, user_parent, prompt_parent, global_parent],
+        help="Execute complete pipeline: format -> tune-reserve -> mount -> fstab -> perms",
+    )
+    p_all.add_argument("-l", "--label", required=True, help="Filesystem label for formatting (e.g. \"ArchiveStorage\")")
+    p_all.add_argument("-t", "--type", default="ext4", help="Target filesystem type (default: ext4)")
+    p_all.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage (largefile: 1MB/inode, largefile4: 4MB/inode, default: 16KB/inode)")
+    p_all.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1)")
+
+    # Stage: format
+    p_fmt = setup_subparsers.add_parser(
+        "format",
+        parents=[device_parent, mount_opt_parent, user_parent, prompt_parent, global_parent],
+        help="Stage 1: Format drive (with inode profile & reserved blocks) and cascade through all stages",
+    )
+    p_fmt.add_argument("-l", "--label", required=True, help="Filesystem label for formatting (required)")
+    p_fmt.add_argument("-t", "--type", default="ext4", help="Target filesystem type (default: ext4)")
+    p_fmt.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage")
+    p_fmt.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1)")
+    p_fmt.add_argument("--no-cascade", action="store_true", help="Format only; do not cascade into tune, mount, fstab, and perms")
+
+    # Stage: tune-reserve
+    p_trb = setup_subparsers.add_parser(
+        "tune-reserve",
+        parents=[device_parent, mount_opt_parent, prompt_parent, global_parent],
+        help="Stage 2: Tune filesystem reserved root block percentage via tune2fs (online/offline)",
+    )
+    p_trb.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1)")
+    p_trb.add_argument("--no-cascade", action="store_true", help="Tune reserved blocks only; do not cascade into mount, fstab, and perms")
+
+    # Stage: mount
+    p_mnt = setup_subparsers.add_parser(
+        "mount",
+        parents=[device_parent, mount_parent, user_parent, prompt_parent, global_parent],
+        help="Stage 3: Mount drive and cascade through FSTAB and PERMS",
+    )
+    p_mnt.add_argument("--no-cascade", action="store_true", help="Mount only; do not cascade into fstab and perms")
+
+    # Stage: fstab
+    p_fst = setup_subparsers.add_parser(
+        "fstab",
+        parents=[device_parent, mount_parent, user_parent, prompt_parent, global_parent],
+        help="Stage 4: Configure /etc/fstab persistence and cascade to PERMS",
+    )
+    p_fst.add_argument("--no-cascade", action="store_true", help="Configure /etc/fstab only; do not cascade into perms")
+
+    # Stage: perms
+    p_prm = setup_subparsers.add_parser(
+        "perms",
+        parents=[mount_parent, user_parent, prompt_parent, global_parent],
+        help="Stage 5: Set mount point directory ownership and standard permissions (755)",
+    )
+    p_prm.add_argument("-d", "--device", required=False, help="Target block device (optional; auto-detected from mountpoint if mounted)")
 
     parser.epilog = """Examples:
-  # 1. Discover all unconfigured or partially configured storage drives:
-  sudo ./drive_setup.py -s
+  # 1. System storage discovery scan (default action):
+  ./drive_setup.py
+  ./drive_setup.py -s -uo --json
 
-  # 2. Audit current setup status and efficiency metrics of a specific drive:
-  ./drive_setup.py -V -d /dev/sdb1 -m /mnt/storage
+  # 2. Audit setup status and efficiency metrics of a specific drive:
+  ./drive_setup.py -V -d /dev/sdb1 -m /mnt/TheArchives
 
-  # 3. Completely provision a media drive from scratch (largefile inodes, 1% reserve):
-  sudo ./drive_setup.py -d /dev/sdc1 -m /mnt/storage -l "storage_pool" -irt largefile -r 1 -fmt -f
+  # 3. Completely provision a media drive from scratch (format -> perms):
+  sudo ./drive_setup.py setup all -d /dev/sdc1 -m /mnt/TheArchives -l "TheArchives" -irt largefile -r 1
 
-  # 4. Tune reserved root blocks on an existing active ext4 drive (reclaiming space live):
-  sudo ./drive_setup.py -d /dev/sdb1 -trb -r 1
+  # 4. Format a partition with largefile inode profile:
+  sudo ./drive_setup.py setup format -d /dev/sdc1 -l "TheArchives" -irt largefile
 
-  # 5. Mount an existing formatted drive and cascade fstab, perms & tuning:
-  sudo ./drive_setup.py -d /dev/sdb1 -m /mnt/storage -mnt
+  # 5. Live tune reserved root blocks on an active ext4 drive (reclaiming space):
+  sudo ./drive_setup.py setup tune-reserve -d /dev/sdb1 -r 1
 
-  # 6. Tune ATA Advanced Power Management (APM) on an HDD with breadcrumb event:
-  sudo ./drive_setup.py -d /dev/sdb --tune-apm 128
+  # 6. Mount an existing formatted drive and configure fstab & ownership:
+  sudo ./drive_setup.py setup mount -d /dev/sdb1 -m /mnt/TheArchives
+
+  # 7. Tune ATA Advanced Power Management (APM) on an HDD:
+  sudo ./drive_setup.py apm -d /dev/sdb -l 128 -r
 """
     return parser
 
@@ -2811,9 +2941,8 @@ def main() -> None:
         enabled=not args.no_telemetry,
     )
 
-    # Standalone Mode: Reload Udev Rules
-    has_step = any([args.format, args.mount, args.fstab, args.perms, args.tune_reserve_block, args.all])
-    if args.reload_udev and args.tune_apm is None and not args.verify and not args.scan and not args.unconfigured_only and not has_step:
+    # Standalone Mode: Reload Udev Rules (via root --reload-udev or apm -r without -l)
+    if (getattr(args, "reload_udev", False) and getattr(args, "level", None) is None and args.command in (None, "apm") and not getattr(args, "verify", False)):
         if os.geteuid() != 0:
             ErrorPresenter.render_error(
                 error_code="E_PERMISSION_DENIED",
@@ -2833,45 +2962,62 @@ def main() -> None:
                 console.print(f"{console.red(console.bold('✗'))} Failed to reload udev rules via udevadm.")
         sys.exit(0 if success else 1)
 
-    # Mode 1: Scan
-    if args.scan or args.unconfigured_only:
-        try:
-            report = do_scan(unconfigured_only=args.unconfigured_only)
-        except StorageSetupError as e:
+    # Subcommand: APM
+    if args.command == "apm":
+        if not args.level:
             ErrorPresenter.render_error(
-                error_code=e.error_code,
-                message=e.message,
-                remediation=e.remediation,
+                error_code="E_MISSING_APM_LEVEL",
+                message="Target APM level is required for 'apm' subcommand.",
+                remediation="Specify APM level with '-l <level>' (e.g. -l 128, -l 254, -l off), or use '-r' to reload udev.",
                 console=console,
                 json_mode=json_mode,
-                extra=e.extra,
             )
             sys.exit(1)
 
-        # Dispatch individual observation breadcrumbs for discovered devices (requires sudo)
-        if os.geteuid() == 0:
-            if not args.unconfigured_only:
-                for dev, state in report.configured_devices:
-                    obs_payload = build_storage_observation_payload(dev, state)
-                    breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=dev.path)
-            for unc in report.unconfigured_devices:
-                obs_payload = build_storage_observation_payload(unc.device, unc.state)
-                breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=unc.device.path)
-        else:
-            logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
+        if not args.device:
+            ErrorPresenter.render_error(
+                error_code="E_MISSING_DEVICE",
+                message="Target device is required for 'apm' subcommand.",
+                remediation="Specify target drive with '-d <device>' (e.g. -d /dev/sdb).",
+                console=console,
+                json_mode=json_mode,
+            )
+            sys.exit(1)
 
-        if json_mode:
-            sys.exit(ScanPresenter.render_json(report))
-        else:
-            sys.exit(ScanPresenter.render_table(report, console))
+        sys.exit(do_tune_apm(
+            device=args.device,
+            target_apm_str=args.level,
+            assume_yes=args.yes,
+            console=console,
+            breadcrumbs=breadcrumbs,
+            no_persist_apm=args.no_persist,
+            udev_match=args.match,
+            reload_udev=args.reload_udev,
+            json_mode=json_mode,
+        ))
 
-    # Mode 2: Verify
-    if args.verify:
+    # Subcommand: Setup (or Provision)
+    if args.command in ("setup", "provision"):
+        if not getattr(args, "stage", None):
+            ErrorPresenter.render_error(
+                error_code="E_MISSING_STAGE",
+                message="No setup stage specified.",
+                remediation="Specify a stage: all, format, tune-reserve, mount, fstab, perms. (e.g. 'drive_setup.py setup all -h')",
+                console=console,
+                json_mode=json_mode,
+            )
+            sys.exit(1)
+
+        run_setup(args, console=console)
+        sys.exit(0)
+
+    # Root Mode: Verify
+    if getattr(args, "verify", False):
         if not args.device:
             ErrorPresenter.render_error(
                 error_code="E_MISSING_DEVICE",
                 message="Target device is required for --verify mode.",
-                remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
+                remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb1).",
                 console=console,
                 json_mode=json_mode,
             )
@@ -2905,82 +3051,37 @@ def main() -> None:
         else:
             sys.exit(VerifyPresenter.render_table(report, console))
 
-    # Mode 3: Tune APM
-    if args.tune_apm is not None:
-        if not args.device:
-            ErrorPresenter.render_error(
-                error_code="E_MISSING_DEVICE",
-                message="Target device is required for --tune-apm.",
-                remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
-                console=console,
-                json_mode=json_mode,
-            )
-            if not json_mode:
-                parser.print_help(sys.stderr)
-            sys.exit(1)
-
-        sys.exit(do_tune_apm(
-            device=args.device,
-            target_apm_str=args.tune_apm,
-            assume_yes=args.yes,
-            console=console,
-            breadcrumbs=breadcrumbs,
-            no_persist_apm=args.no_persist_apm,
-            udev_match=args.udev_match,
-            reload_udev=args.reload_udev,
-            json_mode=json_mode,
-        ))
-
-    # Mode 4: Setup Actions
-    has_step = any([args.format, args.mount, args.fstab, args.perms, args.tune_reserve_block, args.all])
-    if not has_step:
+    # Root Mode: Discovery Scan (Default action when no subcommand or -V)
+    unconfigured_only = getattr(args, "unconfigured_only", False)
+    try:
+        report = do_scan(unconfigured_only=unconfigured_only)
+    except StorageSetupError as e:
         ErrorPresenter.render_error(
-            error_code="E_MISSING_STAGE",
-            message="No setup stage specified.",
-            remediation="Specify a starting stage (-fmt, -mnt, -fst, -p, -trb), '--tune-apm <LEVEL>', or use '-a / --all'.",
+            error_code=e.error_code,
+            message=e.message,
+            remediation=e.remediation,
             console=console,
             json_mode=json_mode,
-        )
-        if not json_mode:
-            parser.print_help(sys.stderr)
-        sys.exit(1)
-
-    if os.geteuid() != 0:
-        ErrorPresenter.render_error(
-            error_code="E_PERMISSION_DENIED",
-            message="Modifying storage configuration requires administrative privileges (sudo).",
-            remediation=f"Re-run command with sudo: sudo {' '.join(sys.argv)}",
-            console=console,
-            json_mode=json_mode,
+            extra=e.extra,
         )
         sys.exit(1)
 
-    if not args.device:
-        ErrorPresenter.render_error(
-            error_code="E_MISSING_DEVICE",
-            message="Target device is required for setup.",
-            remediation="Specify device using '-d <device>' (e.g. -d /dev/sdb).",
-            console=console,
-            json_mode=json_mode,
-        )
-        if not json_mode:
-            parser.print_help(sys.stderr)
-        sys.exit(1)
+    # Dispatch individual observation breadcrumbs for discovered devices (requires sudo)
+    if os.geteuid() == 0:
+        if not unconfigured_only:
+            for dev, state in report.configured_devices:
+                obs_payload = build_storage_observation_payload(dev, state)
+                breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=dev.path)
+        for unc in report.unconfigured_devices:
+            obs_payload = build_storage_observation_payload(unc.device, unc.state)
+            breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=unc.device.path)
+    else:
+        logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
 
-    only_tuning = args.tune_reserve_block and not any([args.format, args.mount, args.fstab, args.perms, args.all])
-    if not args.mountpoint and not only_tuning:
-        ErrorPresenter.render_error(
-            error_code="E_MISSING_MOUNTPOINT",
-            message="Target mount point directory is required for setup.",
-            remediation="Specify mount point using '-m <path>' (e.g. -m /mnt/storage).",
-            console=console,
-            json_mode=json_mode,
-        )
-        if not json_mode:
-            parser.print_help(sys.stderr)
-        sys.exit(1)
-
-    run_setup(args, console=console)
+    if json_mode:
+        sys.exit(ScanPresenter.render_json(report))
+    else:
+        sys.exit(ScanPresenter.render_table(report, console))
 
 
 if __name__ == "__main__":
