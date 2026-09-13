@@ -264,16 +264,38 @@ Observation breadcrumbs emitted during `--verify` and `--scan` stream self-docum
   "label": "The_Archives",
   "mountpoint": "/mnt/TheArchives",
   "ext4_root_reserved_pct": 1.0,
+  "ext4_root_reserved_bytes": 19998441472,
   "ext4_root_reserved_gb": 18.63,
+  "ext4_inode_table_overhead_bytes": 31258288128,
   "ext4_inode_table_overhead_gb": 29.11,
   "ext4_inode_ratio_profile": "default"
 }
 ```
 
 * **`ext4_root_reserved_pct`**: Root block reservation percentage (`1.0%` homelab media standard vs `5.0%` OS default).
-* **`ext4_root_reserved_gb`**: Exact capacity reserved exclusively for root.
-* **`ext4_inode_table_overhead_gb`**: Disk space allocated to inode tables.
+* **`ext4_root_reserved_bytes`**: Exact raw byte count reserved exclusively for root (for exact LogQL calculations).
+* **`ext4_root_reserved_gb`**: Convenient rounded gigabytes reserved for root.
+* **`ext4_inode_table_overhead_bytes`**: Exact disk bytes allocated to inode tables.
+* **`ext4_inode_table_overhead_gb`**: Convenient rounded gigabytes allocated to inode tables.
 * **`ext4_inode_ratio_profile`**: Inode density profile (`largefile`, `largefile4`, or `default`).
+
+> [!NOTE]
+> **Telemetry Boundary (Prometheus vs. Loki)**:
+> Dynamic time-series metrics (total/used/free inodes, live filesystem free bytes, real-time spindle states, and SMART health) are intentionally omitted from this event telemetry because they are continuously scraped by `node_exporter` and `smartctl_exporter` into Prometheus/Mimir. `drive_setup.py` strictly audits static storage architecture, superblock ext4 allocation geometry, and configured hardware APM policy.
+
+#### Telemetry Event & Action Taxonomy
+
+| Event Domain (`event`) | Action (`action`) | Trigger / Operation | Indexed Labels |
+| :--- | :--- | :--- | :--- |
+| `storage_audit` | `scan` | System-wide block device discovery (`--scan`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_audit` | `verify` | Mountpoint and persistence audit (`--verify`) | `source`, `event`, `action`, `level`, `device` |
+| `hardware_tune` | `apm_tune` | ATA APM power level tuned (`--tune-apm`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `format` | Ext4 filesystem creation (`--format`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `tune_reserve` | Root reserved block tuning (`-trb`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `mount` | Filesystem mount (`--mount`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `fstab` | `/etc/fstab` persistence update (`--fstab`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `permissions` | Directory chown / chmod (`--perms`) | `source`, `event`, `action`, `level`, `device` |
+| `storage_provision` | `setup_all` | End-to-end cascading setup pipeline (`--all`) | `source`, `event`, `action`, `level`, `device` |
 
 ### 2. Alloy Configuration (`config.river`)
 Declare a `loki.source.api` block in Alloy that feeds into your existing `loki.write` block:

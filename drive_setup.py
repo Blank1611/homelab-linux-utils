@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -261,6 +262,46 @@ def run_cmd(
 # ==============================================================================
 # TELEMETRY & EVENT BREADCRUMBS GATEWAY
 # ==============================================================================
+class BreadcrumbEvent(str, Enum):
+    """Broad operational domain category in Grafana Loki."""
+    STORAGE_AUDIT     = "storage_audit"       # Read-only state inspection & baselining
+    HARDWARE_TUNE     = "hardware_tune"       # Physical hardware policy adjustments (APM)
+    STORAGE_PROVISION = "storage_provision"   # Mutating disk lifecycle (format, mount, fstab)
+
+    def __str__(self) -> str:
+        return self.value
+
+
+class BreadcrumbAction(str, Enum):
+    """Specific operational action executed by drive_setup."""
+    # --- 1. Storage Audit Actions ---
+    SCAN         = "scan"                # System-wide storage discovery
+    VERIFY       = "verify"              # Target mountpoint/device verification
+
+    # --- 2. Hardware Tune Actions ---
+    APM_TUNE     = "apm_tune"            # ATA APM level adjustment & udev persistence
+
+    # --- 3. Storage Provisioning Actions ---
+    FORMAT       = "format"              # mkfs.ext4 creation
+    TUNE_RESERVE = "tune_reserve"        # tune2fs root block reservation
+    MOUNT        = "mount"               # Directory mount operation
+    FSTAB        = "fstab"               # /etc/fstab persistence entry
+    PERMISSIONS  = "permissions"         # Ownership and chmod configuration
+    SETUP_ALL    = "setup_all"           # Cascading lifecycle pipeline
+
+    def __str__(self) -> str:
+        return self.value
+
+    @property
+    def event(self) -> BreadcrumbEvent:
+        """Maps each action to its canonical parent event category."""
+        if self in (BreadcrumbAction.SCAN, BreadcrumbAction.VERIFY):
+            return BreadcrumbEvent.STORAGE_AUDIT
+        if self == BreadcrumbAction.APM_TUNE:
+            return BreadcrumbEvent.HARDWARE_TUNE
+        return BreadcrumbEvent.STORAGE_PROVISION
+
+
 class BreadcrumbPublisher:
     """
     Independent event telemetry gateway for shipping structured operational
@@ -284,21 +325,21 @@ class BreadcrumbPublisher:
         except Exception:
             self._hostname = "localhost"
 
-    def info(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+    def info(self, action: str, payload: Dict[str, Any], device: Optional[str] = None, event: Optional[str] = None) -> bool:
         """Publishes an informational operational breadcrumb (level: info)."""
-        return self.publish(action=action, payload=payload, device=device, level="info")
+        return self.publish(action=action, payload=payload, device=device, level="info", event=event)
 
-    def warn(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+    def warn(self, action: str, payload: Dict[str, Any], device: Optional[str] = None, event: Optional[str] = None) -> bool:
         """Publishes a warning operational breadcrumb (level: warn)."""
-        return self.publish(action=action, payload=payload, device=device, level="warn")
+        return self.publish(action=action, payload=payload, device=device, level="warn", event=event)
 
-    def error(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+    def error(self, action: str, payload: Dict[str, Any], device: Optional[str] = None, event: Optional[str] = None) -> bool:
         """Publishes an error operational breadcrumb (level: error)."""
-        return self.publish(action=action, payload=payload, device=device, level="error")
+        return self.publish(action=action, payload=payload, device=device, level="error", event=event)
 
-    def debug(self, action: str, payload: Dict[str, Any], device: Optional[str] = None) -> bool:
+    def debug(self, action: str, payload: Dict[str, Any], device: Optional[str] = None, event: Optional[str] = None) -> bool:
         """Publishes a debug operational breadcrumb (level: debug)."""
-        return self.publish(action=action, payload=payload, device=device, level="debug")
+        return self.publish(action=action, payload=payload, device=device, level="debug", event=event)
 
     def publish(
         self,
@@ -306,6 +347,7 @@ class BreadcrumbPublisher:
         payload: Dict[str, Any],
         device: Optional[str] = None,
         level: str = "info",
+        event: Optional[str] = None,
     ) -> bool:
         """
         Accepts a structured payload, enriches it with contextual metadata,
@@ -316,11 +358,25 @@ class BreadcrumbPublisher:
 
         now_ns = str(time.time_ns())
 
+        action_str = action.value if hasattr(action, "value") else str(action)
+
+        # Resolve event category
+        if event is not None:
+            eff_event = event.value if hasattr(event, "value") else str(event)
+        elif isinstance(action, BreadcrumbAction):
+            eff_event = action.event.value
+        else:
+            try:
+                eff_event = BreadcrumbAction(action_str).event.value
+            except ValueError:
+                eff_event = BreadcrumbEvent.STORAGE_AUDIT.value
+
         # 1. Automatic Metadata Enrichment
         operator = os.getenv("SUDO_USER") or getpass.getuser()
         enriched_data = {
             "source": self.source,
-            "action": action,
+            "event": eff_event,
+            "action": action_str,
             "level": level,
             "device": device,
             "host": self._hostname,
@@ -331,7 +387,8 @@ class BreadcrumbPublisher:
         # 2. Loki Push Schema Assembly
         stream_labels = {
             "source": self.source,
-            "action": action,
+            "event": eff_event,
+            "action": action_str,
             "level": level,
         }
         if device:
@@ -350,6 +407,8 @@ class BreadcrumbPublisher:
 
         # 3. Fail-Safe HTTP Transport
         target_url = f"{self.endpoint_url.rstrip('/')}/loki/api/v1/push"
+        compact_payload = json.dumps(enriched_data)
+        logger.info(f"Publishing crumb to {target_url}: {compact_payload}")
         try:
             req = urllib.request.Request(
                 target_url,
@@ -435,6 +494,71 @@ class DeviceState:
     apm_status_label: Optional[str] = None
     apm_thermal_note: Optional[str] = None
 
+    @property
+    def resolved_model(self) -> str:
+        """Resolves drive model, prioritizing device model, parent disk model, or 'Generic'."""
+        if self.device and self.device.model:
+            return self.device.model
+        if self.parent_device and self.parent_device.model:
+            return self.parent_device.model
+        return "Generic"
+
+    def get_model(self, dev: Optional[BlockDevice] = None) -> str:
+        """Resolves drive model with optional dev override."""
+        if dev and dev.model:
+            return dev.model
+        return self.resolved_model
+
+    @property
+    def root_reserved_gb(self) -> Optional[float]:
+        """Calculates root reserved space in rounded GB from raw bytes."""
+        if self.reserved_space_bytes is not None:
+            return round(self.reserved_space_bytes / (1024 ** 3), 2)
+        return None
+
+    @property
+    def inode_overhead_gb(self) -> Optional[float]:
+        """Calculates inode table overhead in rounded GB from raw bytes."""
+        if self.inode_table_overhead_bytes is not None:
+            return round(self.inode_table_overhead_bytes / (1024 ** 3), 2)
+        return None
+
+    def to_storage_metrics(self, dev: Optional[BlockDevice] = None) -> Dict[str, Any]:
+        """
+        Produces canonical, self-documenting storage metrics dictionary,
+        including exact raw bytes and convenience rounded GB values.
+
+        NOTE ON TELEMETRY SCOPE & METRIC BOUNDARIES:
+        Dynamic runtime time-series (total/used/free inodes, live filesystem free bytes,
+        real-time spindle power state, SMART wear gauges) are intentionally excluded
+        from this payload. Those are continuously scraped by node_exporter and
+        smartctl_exporter into Prometheus/Mimir. This payload strictly captures static
+        storage architecture, superblock ext4 tuning, and configured APM power policies.
+        """
+        parent_disk_name = self.parent_device.path.replace("/dev/", "") if self.parent_device else None
+        eff_dev = dev or self.device
+        device_name = (eff_dev.path if eff_dev and eff_dev.path else self.device_path).replace("/dev/", "")
+        size_str = eff_dev.size if eff_dev and eff_dev.size else (self.device.size if self.device else None)
+
+        return {
+            "device": device_name,
+            "parent_disk": parent_disk_name,
+            "model": self.get_model(eff_dev),
+            "size": size_str,
+            "is_rotational": self.is_rotational,
+            "apm_level": self.apm_level,
+            "apm_status": self.apm_status_label,
+            "fstype": self.fstype,
+            "label": self.label,
+            "mountpoint": self.current_mounts[0] if self.current_mounts else None,
+            "ext4_root_reserved_pct": self.reserved_percent,
+            "ext4_root_reserved_bytes": self.reserved_space_bytes,
+            "ext4_root_reserved_gb": self.root_reserved_gb,
+            "ext4_inode_table_overhead_bytes": self.inode_table_overhead_bytes,
+            "ext4_inode_table_overhead_gb": self.inode_overhead_gb,
+            "ext4_inode_ratio_profile": self.detected_inode_profile,
+        }
+
 
 @dataclass
 class StepDecision:
@@ -493,44 +617,13 @@ class ActionPlan:
 def build_storage_observation_payload(
     dev: BlockDevice,
     state: DeviceState,
-    action: str,
+    action: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Builds a structured storage observation payload with self-documenting ext4 metrics,
     suitable for pushing to Grafana Alloy / Loki as an operational breadcrumb.
     """
-    res_bytes = state.reserved_space_bytes
-    res_pct = state.reserved_percent
-    root_reserved_gb: Optional[float] = None
-    inode_overhead_gb: Optional[float] = None
-
-    if res_bytes is not None:
-        root_reserved_gb = round(res_bytes / (1024 ** 3), 2)
-
-    if state.inode_table_overhead_bytes is not None:
-        inode_overhead_gb = round(state.inode_table_overhead_bytes / (1024 ** 3), 2)
-
-    parent_disk_name = state.parent_device.path.replace("/dev/", "") if state.parent_device else None
-    device_name = dev.path.replace("/dev/", "") if dev.path else state.device_path.replace("/dev/", "")
-
-    return {
-        "event": "storage_audit",
-        "action": action,
-        "device": device_name,
-        "parent_disk": parent_disk_name,
-        "model": dev.model or (state.device.model if state.device else None) or (state.parent_device.model if state.parent_device else None),
-        "size": dev.size,
-        "is_rotational": state.is_rotational,
-        "apm_level": state.apm_level,
-        "apm_status": state.apm_status_label,
-        "fstype": state.fstype,
-        "label": state.label,
-        "mountpoint": state.current_mounts[0] if state.current_mounts else None,
-        "ext4_root_reserved_pct": res_pct,
-        "ext4_root_reserved_gb": root_reserved_gb,
-        "ext4_inode_table_overhead_gb": inode_overhead_gb,
-        "ext4_inode_ratio_profile": state.detected_inode_profile,
-    }
+    return state.to_storage_metrics(dev)
 
 
 # ==============================================================================
@@ -1304,11 +1397,7 @@ class VerifyPresenter:
     @staticmethod
     def render_json(report: VerifyReport) -> int:
         state = report.state
-        dev_model = "Generic"
-        if state.device and state.device.model:
-            dev_model = state.device.model
-        elif state.parent_device and state.parent_device.model:
-            dev_model = state.parent_device.model
+        dev_model = state.resolved_model
         dev_size = state.device.size if state.device and state.device.size else "Unknown"
         dev_type = state.device.type if state.device and state.device.type else "block"
 
@@ -1359,10 +1448,12 @@ class VerifyPresenter:
                 "total_inodes": state.total_inodes,
                 "used_inodes": state.used_inodes,
                 "free_inodes": state.free_inodes,
-                "inode_profile": state.detected_inode_profile,
-                "inode_table_overhead_bytes": state.inode_table_overhead_bytes,
-                "reserved_space_bytes": state.reserved_space_bytes,
-                "reserved_percent": state.reserved_percent,
+                "ext4_inode_ratio_profile": state.detected_inode_profile,
+                "ext4_inode_table_overhead_bytes": state.inode_table_overhead_bytes,
+                "ext4_inode_table_overhead_gb": state.inode_overhead_gb,
+                "ext4_root_reserved_pct": state.reserved_percent,
+                "ext4_root_reserved_bytes": state.reserved_space_bytes,
+                "ext4_root_reserved_gb": state.root_reserved_gb,
             } if state.fstype == "ext4" else None,
             "apm": {
                 "is_rotational": state.is_rotational,
@@ -1548,7 +1639,7 @@ class ScanPresenter:
                             else:
                                 inode_text = f"{in_cnt} ({ovh_str} ovh)"
 
-                            res_gb = state.reserved_space_bytes / (1024 * 1024 * 1024)
+                            res_gb = state.root_reserved_gb if state.root_reserved_gb is not None else 0.0
                             res_pct = state.reserved_percent if state.reserved_percent is not None else 0.0
                             reserved_text = f"{res_gb:.1f} GB ({res_pct:.1f}%)"
 
@@ -1587,15 +1678,8 @@ class ScanPresenter:
             for item in unconfigured_devices:
                 dev = item.device
                 state = item.state
-                model = ""
-                if state.device and state.device.model:
-                    model = state.device.model
-                elif state.parent_device and state.parent_device.model:
-                    model = state.parent_device.model
-                elif dev.model:
-                    model = dev.model
-
-                model_str = (model or "Generic")[:21]
+                model = state.get_model(dev)
+                model_str = model[:21]
                 fs_str = (state.fstype or "-")[:7]
 
                 details = item.details
@@ -1631,6 +1715,7 @@ class ScanPresenter:
         for dev, st in report.configured_devices:
             cfg_out.append({
                 "device": dev.path,
+                "model": st.get_model(dev),
                 "size": dev.size or (st.device.size if st.device else None),
                 "is_rotational": st.is_rotational,
                 "apm_level": st.apm_level,
@@ -1648,23 +1733,19 @@ class ScanPresenter:
                 "total_inodes": st.total_inodes,
                 "free_inodes": st.free_inodes,
                 "used_inodes": st.used_inodes,
-                "inode_profile": st.detected_inode_profile,
-                "inode_table_overhead_bytes": st.inode_table_overhead_bytes,
-                "reserved_space_bytes": st.reserved_space_bytes,
-                "reserved_percent": st.reserved_percent,
+                "ext4_inode_ratio_profile": st.detected_inode_profile,
+                "ext4_inode_table_overhead_bytes": st.inode_table_overhead_bytes,
+                "ext4_inode_table_overhead_gb": st.inode_overhead_gb,
+                "ext4_root_reserved_pct": st.reserved_percent,
+                "ext4_root_reserved_bytes": st.reserved_space_bytes,
+                "ext4_root_reserved_gb": st.root_reserved_gb,
             })
 
         unc_out = []
         for item in report.unconfigured_devices:
             dev = item.device
             st = item.state
-            model = ""
-            if st.device and st.device.model:
-                model = st.device.model
-            elif st.parent_device and st.parent_device.model:
-                model = st.parent_device.model
-            elif dev.model:
-                model = dev.model
+            model = st.get_model(dev)
 
             unc_out.append({
                 "device": dev.path,
@@ -2585,7 +2666,7 @@ def do_tune_apm(
 
     # 12. Dispatch Breadcrumb Event to Alloy/Loki
     telemetry_sent = breadcrumbs.info(
-        action="apm_tune",
+        action=BreadcrumbAction.APM_TUNE,
         device=disk_path,
         payload={
             "old_apm": curr_level,
@@ -2771,11 +2852,11 @@ def main() -> None:
         if os.geteuid() == 0:
             if not args.unconfigured_only:
                 for dev, state in report.configured_devices:
-                    obs_payload = build_storage_observation_payload(dev, state, action="scan")
-                    breadcrumbs.info(action="storage_audit", payload=obs_payload, device=dev.path)
+                    obs_payload = build_storage_observation_payload(dev, state)
+                    breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=dev.path)
             for unc in report.unconfigured_devices:
-                obs_payload = build_storage_observation_payload(unc.device, unc.state, action="scan")
-                breadcrumbs.info(action="storage_audit", payload=obs_payload, device=unc.device.path)
+                obs_payload = build_storage_observation_payload(unc.device, unc.state)
+                breadcrumbs.info(action=BreadcrumbAction.SCAN, payload=obs_payload, device=unc.device.path)
         else:
             logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
 
@@ -2814,8 +2895,8 @@ def main() -> None:
         # Dispatch observation telemetry breadcrumb for verified device (requires sudo)
         if os.geteuid() == 0:
             eff_dev = report.state.device or BlockDevice(name="", path=report.state.device_path, size="", type="")
-            obs_payload = build_storage_observation_payload(eff_dev, report.state, action="verify")
-            breadcrumbs.info(action="storage_audit", payload=obs_payload, device=report.state.device_path)
+            obs_payload = build_storage_observation_payload(eff_dev, report.state)
+            breadcrumbs.info(action=BreadcrumbAction.VERIFY, payload=obs_payload, device=report.state.device_path)
         else:
             logger.debug("Skipping observation telemetry publish: root privileges (sudo) required for complete storage metrics.")
 
