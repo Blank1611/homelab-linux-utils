@@ -452,6 +452,11 @@ class FstabEntry:
     passno: int
     raw_line: str
 
+    @property
+    def is_automount(self) -> bool:
+        """Checks if the fstab entry has x-systemd.automount configured."""
+        return "x-systemd.automount" in (self.mntops or "")
+
 
 @dataclass
 class DeviceState:
@@ -522,6 +527,11 @@ class DeviceState:
         if self.inode_table_overhead_bytes is not None:
             return round(self.inode_table_overhead_bytes / (1024 ** 3), 2)
         return None
+
+    @property
+    def has_automount(self) -> bool:
+        """Indicates whether this device is configured with systemd automount in /etc/fstab."""
+        return bool(self.fstab_entry and self.fstab_entry.is_automount)
 
     def to_storage_metrics(self, dev: Optional[BlockDevice] = None) -> Dict[str, Any]:
         """
@@ -720,8 +730,14 @@ def confirm(
 # ==============================================================================
 # FSTAB MANAGER (SAFE & ATOMIC)
 # ==============================================================================
+DEFAULT_FSTAB_OPTIONS = "defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10"
+FALLBACK_FSTAB_OPTIONS = "defaults,nofail"
+
+
 class FstabManager:
     FSTAB_PATH = Path("/etc/fstab")
+    DEFAULT_OPTIONS = DEFAULT_FSTAB_OPTIONS
+    FALLBACK_OPTIONS = FALLBACK_FSTAB_OPTIONS
 
     @classmethod
     def read_entries(cls) -> List[FstabEntry]:
@@ -774,31 +790,91 @@ class FstabManager:
         return None
 
     @classmethod
-    def append_entry(cls, uuid: str, mountpoint: str, fstype: str = "ext4", options: str = "defaults,nofail", freq: int = 0, passno: int = 2) -> None:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    def upsert_entry(
+        cls,
+        uuid: str,
+        mountpoint: str,
+        fstype: str = "ext4",
+        options: str = DEFAULT_FSTAB_OPTIONS,
+        freq: int = 0,
+        passno: int = 2,
+        force: bool = False,
+    ) -> bool:
+        """
+        Atomically appends or updates an entry in /etc/fstab with backup.
+        If an entry matching uuid or mountpoint already exists, updates it in-place if force=True,
+        or raises RuntimeError if force=False.
+        Also runs 'systemctl daemon-reload' to register changes with systemd.
+        """
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
         backup_path = cls.FSTAB_PATH.with_name(f"fstab.bak.{timestamp}")
         tmp_path = cls.FSTAB_PATH.with_name(f"fstab.tmp.{os.getpid()}")
 
         with open(cls.FSTAB_PATH, "r", encoding="utf-8") as f:
-            content = f.read()
+            lines = f.readlines()
 
         shutil.copy2(cls.FSTAB_PATH, backup_path)
         logger.info(f"Created /etc/fstab backup at: {backup_path}")
 
-        new_entry = (
-            f"\n# Storage Mount point for {mountpoint}\n"
-            f"UUID={uuid}  {mountpoint}  {fstype}  {options}  {freq}  {passno}\n"
-        )
+        clean_uuid = uuid[5:] if uuid.startswith("UUID=") else uuid
+        uuid_target = f"UUID={clean_uuid}"
+        uuid_quoted = f'UUID="{clean_uuid}"'
+        new_line = f"UUID={clean_uuid}  {mountpoint}  {fstype}  {options}  {freq}  {passno}\n"
+
+        replaced = False
+        new_lines: List[str] = []
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(line)
+                continue
+            parts = stripped.split()
+            is_match = False
+            if len(parts) >= 2:
+                spec, mp = parts[0], parts[1]
+                if spec in (uuid_target, uuid_quoted) or mp == mountpoint:
+                    is_match = True
+
+            if is_match:
+                if not force:
+                    raise RuntimeError(f"Entry already exists in /etc/fstab for mountpoint '{mountpoint}' or UUID='{uuid}'. Use force=True to update.")
+                new_lines.append(new_line)
+                replaced = True
+                logger.info(f"Updated existing /etc/fstab entry for {mountpoint} in-place.")
+            else:
+                new_lines.append(line)
+
+        if not replaced:
+            new_lines.append(f"\n# Storage Mount point for {mountpoint}\n")
+            new_lines.append(new_line)
+            logger.info(f"Appended new entry to /etc/fstab for {mountpoint} with UUID={uuid}.")
 
         with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.write(new_entry)
+            f.writelines(new_lines)
             f.flush()
             os.fsync(f.fileno())
 
         shutil.copymode(cls.FSTAB_PATH, tmp_path)
         os.replace(tmp_path, cls.FSTAB_PATH)
         logger.info(f"Successfully configured /etc/fstab with UUID={uuid}.")
+
+        # Trigger systemd daemon-reload so automount unit is registered immediately
+        logger.info("Executing systemctl daemon-reload to register fstab automount changes...")
+        run_cmd(["systemctl", "daemon-reload"], check=False)
+        return True
+
+    @classmethod
+    def append_entry(
+        cls,
+        uuid: str,
+        mountpoint: str,
+        fstype: str = "ext4",
+        options: str = DEFAULT_FSTAB_OPTIONS,
+        freq: int = 0,
+        passno: int = 2,
+    ) -> None:
+        cls.upsert_entry(uuid=uuid, mountpoint=mountpoint, fstype=fstype, options=options, freq=freq, passno=passno)
 
 
 # ==============================================================================
@@ -1202,6 +1278,9 @@ def do_verify(
     if target_mountpoint:
         if target_mountpoint in state.current_mounts:
             pass
+        elif state.has_automount and state.fstab_entry and state.fstab_entry.mountpoint == target_mountpoint:
+            # Configured for systemd on-demand automount; idling in standby until access
+            pass
         elif state.is_mounted:
             all_healthy = False
             missing_steps.append(f"--mount (remount to {target_mountpoint})")
@@ -1282,7 +1361,10 @@ class VerifyPresenter:
         # 2. Mount status (--mount / -m)
         if target_mountpoint:
             if target_mountpoint in state.current_mounts:
-                console.print(f"  [{console.green('✓')}] Active Mount (--mount):      Mounted at {console.bold(target_mountpoint)} (-m)")
+                auto_note = f" {console.cyan('(automount active)')}" if state.has_automount else ""
+                console.print(f"  [{console.green('✓')}] Active Mount (--mount):      Mounted at {console.bold(target_mountpoint)} (-m){auto_note}")
+            elif state.has_automount and not state.is_mounted and state.fstab_entry and state.fstab_entry.mountpoint == target_mountpoint:
+                console.print(f"  [{console.green('✓')}] Active Mount (--mount):      {console.cyan('Standby (systemd automount - mounts on-demand)')}")
             elif state.is_mounted:
                 other_mount = state.current_mounts[0]
                 other_msg = f"Mounted at '{other_mount}', expected '{target_mountpoint}'"
@@ -1291,20 +1373,24 @@ class VerifyPresenter:
                 console.print(f"  [{console.red('✗')}] Active Mount (--mount):      {console.red('Device is currently unmounted')}")
         else:
             if state.is_mounted:
-                console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Currently mounted at: {', '.join(state.current_mounts)}")
+                auto_note = f" {console.cyan('(automount active)')}" if state.has_automount else ""
+                console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Currently mounted at: {', '.join(state.current_mounts)}{auto_note}")
+            elif state.has_automount:
+                console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Standby (systemd automount - mounts on-demand)")
             else:
                 console.print(f"  [{console.cyan('ℹ')}] Active Mount (--mount):      Not mounted")
 
         # 3. Persistence (--fstab)
         if state.in_fstab and state.fstab_entry:
+            auto_badge = f" {console.cyan('[automount]')}" if state.has_automount else f" {console.dim('[static]')}"
             if target_mountpoint:
                 if state.fstab_entry.mountpoint == target_mountpoint:
-                    console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Valid persistent entry found in /etc/fstab for {console.bold(target_mountpoint)}")
+                    console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Valid persistent entry found in /etc/fstab for {console.bold(target_mountpoint)}{auto_badge}")
                 else:
-                    fstab_msg = f"/etc/fstab entry points to '{state.fstab_entry.mountpoint}' instead of '{target_mountpoint}'"
+                    fstab_msg = f"/etc/fstab entry points to '{state.fstab_entry.mountpoint}' instead of '{target_mountpoint}'{auto_badge}"
                     console.print(f"  [{console.yellow('!')}] Persistence (--fstab):       {console.yellow(fstab_msg)}")
             else:
-                console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Found in /etc/fstab: {state.fstab_entry.spec} -> {state.fstab_entry.mountpoint}")
+                console.print(f"  [{console.green('✓')}] Persistence (--fstab):       Found in /etc/fstab: {state.fstab_entry.spec} -> {state.fstab_entry.mountpoint}{auto_badge}")
         else:
             console.print(f"  [{console.red('✗')}] Persistence (--fstab):       {console.red('No persistent entry found in /etc/fstab for this device/UUID')}")
 
@@ -1421,19 +1507,22 @@ class VerifyPresenter:
                     "label": state.label,
                 },
                 "mount": {
-                    "healthy": bool(report.target_mountpoint and report.target_mountpoint in state.current_mounts) if report.target_mountpoint else state.is_mounted,
+                    "healthy": bool(report.target_mountpoint and (report.target_mountpoint in state.current_mounts or state.has_automount)) if report.target_mountpoint else (state.is_mounted or state.has_automount),
                     "is_mounted": state.is_mounted,
+                    "is_automount": state.has_automount,
                     "current_mounts": state.current_mounts,
                     "expected_mountpoint": report.target_mountpoint,
                 },
                 "persistence": {
                     "healthy": bool(state.in_fstab and (not report.target_mountpoint or (state.fstab_entry and state.fstab_entry.mountpoint == report.target_mountpoint))),
                     "in_fstab": state.in_fstab,
+                    "is_automount": state.has_automount,
                     "fstab_entry": {
                         "spec": state.fstab_entry.spec,
                         "mountpoint": state.fstab_entry.mountpoint,
                         "fstype": state.fstab_entry.vfstype,
                         "options": state.fstab_entry.mntops,
+                        "is_automount": state.has_automount,
                     } if state.fstab_entry else None,
                 },
                 "permissions": {
@@ -1516,7 +1605,7 @@ def do_scan(unconfigured_only: bool = False) -> ScanReport:
 
     for dev in candidates:
         state = DeviceInspector.inspect(dev.path)
-        is_fully_configured = state.is_formatted and state.is_mounted and state.in_fstab
+        is_fully_configured = state.is_formatted and (state.is_mounted or state.has_automount) and state.in_fstab
 
         if is_fully_configured:
             configured_devices.append((dev, state))
@@ -1537,9 +1626,14 @@ def do_scan(unconfigured_only: bool = False) -> ScanReport:
                 status_badge = "[TEMP MOUNTED]"
                 details = f"Mounted at '{state.current_mounts[0]}', missing fstab"
             elif not state.is_mounted and state.in_fstab:
-                status_clean = "UNMOUNTED_IN_FSTAB"
-                status_badge = "[UNMOUNTED IN FSTAB]"
-                details = "Listed in fstab, but currently unmounted"
+                if state.has_automount:
+                    status_clean = "AUTOMOUNT_STANDBY"
+                    status_badge = "[AUTOMOUNT STANDBY]"
+                    details = "Configured in fstab (automount), standby until accessed"
+                else:
+                    status_clean = "UNMOUNTED_IN_FSTAB"
+                    status_badge = "[UNMOUNTED IN FSTAB]"
+                    details = "Listed in fstab, but currently unmounted"
 
             unconfigured_devices.append(
                 UnconfiguredDevice(
@@ -1574,7 +1668,7 @@ class ScanPresenter:
             console.print(f"{' ' * 45}{console.green(console.bold('CONFIGURED & ACTIVE STORAGE DEVICES'))}")
             console.rule("=", 135)
 
-            header_cfg = f"{'DEVICE':<12} {'SIZE':<7} {'FS (LABEL)':<20} {'MOUNTPOINT':<22} {'FSTAB':<7} {'APM':<12} {'OWNER (PERMS)':<18} {'INODES (OVERHEAD)':<24} {'RESERVED SPACE'}"
+            header_cfg = f"{'DEVICE':<12} {'SIZE':<7} {'FS (LABEL)':<20} {'MOUNTPOINT':<22} {'FSTAB':<10} {'APM':<12} {'OWNER (PERMS)':<18} {'INODES (OVERHEAD)':<24} {'RESERVED SPACE'}"
             console.print(console.bold(header_cfg))
             console.print("-" * 135)
 
@@ -1590,8 +1684,20 @@ class ScanPresenter:
                         fs_label = f'{fs_label} ("{state.label}")'
                     fs_label_str = fs_label[:19]
 
-                    mp_str = (state.current_mounts[0] if state.current_mounts else "-")[:21]
-                    fstab_cell = f"{console.green('[✓]')}    " if state.in_fstab else f"{console.red('[✗]')}    "
+                    if state.current_mounts:
+                        mp_str = state.current_mounts[0][:21]
+                    elif state.has_automount and state.fstab_entry:
+                        mp_str = f"{state.fstab_entry.mountpoint} (auto)"[:21]
+                    else:
+                        mp_str = "-"
+
+                    if state.in_fstab:
+                        if state.has_automount:
+                            fstab_cell = f"{console.green('[✓ auto]')}  "
+                        else:
+                            fstab_cell = f"{console.green('[✓]')}       "
+                    else:
+                        fstab_cell = f"{console.red('[✗]')}       "
 
                     # APM column
                     if state.is_rotational is False:
@@ -1728,6 +1834,8 @@ class ScanPresenter:
                 "mountpoints": st.current_mounts,
                 "in_fstab": st.in_fstab,
                 "fstab_mountpoint": st.fstab_entry.mountpoint if st.fstab_entry else None,
+                "fstab_automount": st.has_automount,
+                "fstab_options": st.fstab_entry.mntops if st.fstab_entry else None,
                 "owner": st.mountpoint_owner,
                 "perms": st.mountpoint_perms,
                 "total_inodes": st.total_inodes,
@@ -1759,6 +1867,9 @@ class ScanPresenter:
                 "fstype": st.fstype,
                 "label": st.label,
                 "uuid": st.uuid,
+                "in_fstab": st.in_fstab,
+                "fstab_automount": st.has_automount,
+                "fstab_options": st.fstab_entry.mntops if st.fstab_entry else None,
                 "status": item.status,
                 "details": f"Label: '{st.label}', {item.details}" if st.label else item.details,
             })
@@ -1900,20 +2011,24 @@ def step_fstab(
     mountpoint: str,
     fstype: str = "ext4",
     assume_yes: bool = False,
+    force: bool = False,
+    no_automount: bool = False,
     console: Optional[Console] = None,
     json_mode: bool = False,
 ) -> None:
     con = console or Console(stream=sys.stdout)
+    options = FALLBACK_FSTAB_OPTIONS if no_automount else DEFAULT_FSTAB_OPTIONS
     blkid = run_cmd(["blkid", "-s", "UUID", "-o", "value", device], console=con)
     uuid = blkid.stdout.strip() if blkid.returncode == 0 else ""
     uuid_str = uuid if uuid else "<DEVICE_UUID>"
-    fstab_line = f"UUID={uuid_str}  {mountpoint}  {fstype}  defaults,nofail  0  2"
+    fstab_line = f"UUID={uuid_str}  {mountpoint}  {fstype}  {options}  0  2"
 
+    opts_desc = "standard" if no_automount else "systemd automount"
     exp = (
-        f"This will retrieve the unique UUID of device '{device}' and add a persistent entry\n"
+        f"This will retrieve the unique UUID of device '{device}' and add a persistent entry ({opts_desc})\n"
         f"                 to '/etc/fstab' to mount it at '{mountpoint}' automatically on system reboot."
     )
-    act = f"Configure persistent mount in /etc/fstab"
+    act = f"Configure persistent mount ({opts_desc}) in /etc/fstab"
 
     if confirm(exp, act, cmd=f"echo '{fstab_line}' >> /etc/fstab", assume_yes=assume_yes, console=con, json_mode=json_mode, step_name="FSTAB"):
         logger.info(f"Extracting device UUID via blkid for {device}...")
@@ -1927,14 +2042,15 @@ def step_fstab(
         logger.info(f"Device UUID identified: {uuid}")
 
         existing = FstabManager.find_entry(uuid=uuid, device_path=device, mountpoint=mountpoint)
-        if existing:
-            logger.warning(f"/etc/fstab entry already exists for this UUID or mountpoint: {existing.raw_line.strip()}. Skipping insertion.")
+        if existing and not force:
+            logger.warning(f"/etc/fstab entry already exists for this UUID or mountpoint: {existing.raw_line.strip()}. Pass -f / --force to update.")
             return
 
-        logger.info("Appending entry to /etc/fstab with atomic backup...")
-        FstabManager.append_entry(uuid=uuid, mountpoint=mountpoint, fstype=fstype, options="defaults,nofail", freq=0, passno=2)
+        action_desc = "Updating" if existing else "Appending"
+        logger.info(f"{action_desc} entry in /etc/fstab with atomic backup...")
+        FstabManager.upsert_entry(uuid=uuid, mountpoint=mountpoint, fstype=fstype, options=options, freq=0, passno=2, force=force)
         if not json_mode:
-            con.print(f"{con.green('[SUCCESS]')} /etc/fstab successfully configured with UUID={uuid}.")
+            con.print(f"{con.green('[SUCCESS]')} /etc/fstab successfully configured with UUID={uuid} ({opts_desc}).")
 
 
 def step_permissions(
@@ -2076,6 +2192,7 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
     username = getattr(args, "user", None) or get_default_user()
     force = getattr(args, "force", False)
     assume_yes = getattr(args, "yes", False)
+    no_automount = getattr(args, "no_automount", False)
 
     # If stage is perms and no device specified, resolve from mountpoint if mounted
     if stage == "perms" and not input_device and mountpoint:
@@ -2313,13 +2430,15 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
 
     # Step: Fstab
     if do_fstab:
+        target_opts = FALLBACK_FSTAB_OPTIONS if no_automount else DEFAULT_FSTAB_OPTIONS
+        opts_desc = "standard" if no_automount else "systemd automount"
         if state.in_fstab and state.fstab_entry and state.fstab_entry.mountpoint == mountpoint:
             if force:
-                decisions.append(StepDecision(len(decisions) + 1, "FSTAB", "FORCE_OVERRIDE", f"Persistent entry already exists; will rewrite (--force enabled)"))
+                decisions.append(StepDecision(len(decisions) + 1, "FSTAB", "FORCE_OVERRIDE", f"Update existing /etc/fstab entry to {opts_desc} options (--force enabled)"))
             else:
                 decisions.append(StepDecision(len(decisions) + 1, "FSTAB", "SKIP", f"Matching persistent entry already active in /etc/fstab for {mountpoint}"))
         else:
-            decisions.append(StepDecision(len(decisions) + 1, "FSTAB", "EXECUTE", f"Add persistent mount entry for UUID to /etc/fstab"))
+            decisions.append(StepDecision(len(decisions) + 1, "FSTAB", "EXECUTE", f"Add persistent mount entry ({opts_desc}) for UUID to /etc/fstab"))
 
     # Step: Perms
     if do_perms:
@@ -2385,7 +2504,7 @@ def run_setup(args: argparse.Namespace, console: Console) -> None:
             elif d.name == "MOUNT":
                 step_mount(device, mountpoint, assume_yes, console=console, json_mode=json_mode)
             elif d.name == "FSTAB":
-                step_fstab(device, mountpoint, fstype, assume_yes, console=console, json_mode=json_mode)
+                step_fstab(device, mountpoint, fstype, assume_yes, force=force, no_automount=no_automount, console=console, json_mode=json_mode)
             elif d.name == "PERMS":
                 step_permissions(mountpoint, username, assume_yes, console=console, json_mode=json_mode)
 
@@ -2845,6 +2964,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_all.add_argument("-t", "--type", default="ext4", help="Target filesystem type (default: ext4)")
     p_all.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage (largefile: 1MB/inode, largefile4: 4MB/inode, default: 16KB/inode)")
     p_all.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1)")
+    p_all.add_argument("--no-automount", action="store_true", help="Disable systemd automount in /etc/fstab (defaults to standard boot-time mount: defaults,nofail)")
 
     # Stage: format
     p_fmt = setup_subparsers.add_parser(
@@ -2857,6 +2977,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_fmt.add_argument("-irt", "--inode-reserve-type", choices=["largefile", "largefile4", "default"], default="largefile", help="Ext4 inode ratio profile for media storage")
     p_fmt.add_argument("-r", "--reserved-percent", type=int, default=1, help="Filesystem reserved root blocks percentage (default: 1)")
     p_fmt.add_argument("--no-cascade", action="store_true", help="Format only; do not cascade into tune, mount, fstab, and perms")
+    p_fmt.add_argument("--no-automount", action="store_true", help="Disable systemd automount in /etc/fstab when cascading to fstab")
 
     # Stage: tune-reserve
     p_trb = setup_subparsers.add_parser(
@@ -2874,6 +2995,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Stage 3: Mount drive and cascade through FSTAB and PERMS",
     )
     p_mnt.add_argument("--no-cascade", action="store_true", help="Mount only; do not cascade into fstab and perms")
+    p_mnt.add_argument("--no-automount", action="store_true", help="Disable systemd automount in /etc/fstab when cascading to fstab")
 
     # Stage: fstab
     p_fst = setup_subparsers.add_parser(
@@ -2882,6 +3004,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Stage 4: Configure /etc/fstab persistence and cascade to PERMS",
     )
     p_fst.add_argument("--no-cascade", action="store_true", help="Configure /etc/fstab only; do not cascade into perms")
+    p_fst.add_argument("--no-automount", action="store_true", help="Disable systemd automount in /etc/fstab (defaults to standard boot-time mount: defaults,nofail)")
 
     # Stage: perms
     p_prm = setup_subparsers.add_parser(

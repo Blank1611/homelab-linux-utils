@@ -20,7 +20,7 @@ It replaces brittle multi-step manual processes (`mkfs`, `tune2fs`, `mkdir`, `mo
   - **Reserved Root Block Tuning (`-r`):** Reduces ext4's default 5% root block reservation down to 1% (or custom percentage), recovering 50–100GB+ of usable space on multi-terabyte drives. Can also be applied live to active filesystems.
 - **Smart Partition Resolution:** Automatically disambiguates parent block devices (e.g., `/dev/sdb`) to child partitions (e.g., `/dev/sdb1`) when only one partition exists, preventing false "unformatted" warnings while preserving parent hardware metadata (model, serial, size).
 - **Accidental Wipe Protection:** Multi-partition disks and drives with existing filesystems cannot be formatted without passing `--force` (`-f`).
-- **Bulletproof Persistence:** Adds `/etc/fstab` entries by **UUID** (never volatile `/dev/sdX` device names) and creates timestamped backups (`/etc/fstab.bak.<timestamp>`) prior to any modification.
+- **Bulletproof Persistence & Systemd Automount:** Adds `/etc/fstab` entries by **UUID** (never volatile `/dev/sdX` device names), creates timestamped backups (`/etc/fstab.bak.<timestamp>`), and configures resilient on-demand systemd automount (`defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10`) with automatic `systemctl daemon-reload`. Operators can opt out via `--no-automount`.
 - **Dynamic Personalization & Caller Resolution:** Automatically personalizes CLI descriptions to the local machine's hostname (`socket.gethostname()`) and defaults directory ownership to the invoking caller (`$SUDO_USER` or current user), with full support for explicit user overrides (`-u / --user`).
 - **Live Output Streaming & Detailed Logging:** Real-time stdout/stderr output streaming for long operations (e.g., `mkfs.ext4` inode allocation and journal creation), complete with ANSI-colored logging and a `-q / --quiet` option.
 - **Safety-by-Design Architecture:** Pure read-only discovery (`scan`) and audit (`verify`) at the root level; mutating operations strictly isolated to dedicated subcommands (`setup` and `apm`).
@@ -69,14 +69,14 @@ Example scan output:
 =======================================================================================================================================
                                              CONFIGURED & ACTIVE STORAGE DEVICES
 =======================================================================================================================================
-DEVICE       SIZE    FS (LABEL)           MOUNTPOINT             FSTAB   APM          OWNER (PERMS)      INODES (OVERHEAD)        RESERVED SPACE
+DEVICE       SIZE    FS (LABEL)           MOUNTPOINT             FSTAB      APM          OWNER (PERMS)      INODES (OVERHEAD)        RESERVED SPACE
 ---------------------------------------------------------------------------------------------------------------------------------------
-/dev/sdb1    1.8T    ext4 ("storage_pool  /mnt/storage           [✓]     128 (Bal)    <user> (755)       122.1M (29.1 GB ovh)     18.6 GB (1.0%)
+/dev/sdb1    1.8T    ext4 ("storage_pool  /mnt/storage           [✓ auto]   128 (Bal)    <user> (755)       122.1M (29.1 GB ovh)     18.6 GB (1.0%)
 ---------------------------------------------------------------------------------------------------------------------------------------
 Total Configured: 1 drive(s) healthy and persistent.
 
 =======================================================================================================================================
-                                            UNCONFIGURED / AVAILABLE STORAGE DEVICES
+                                             UNCONFIGURED / AVAILABLE STORAGE DEVICES
 =======================================================================================================================================
 DEVICE         SIZE     TYPE   MODEL                  FS       STATUS                   DETAILS
 ---------------------------------------------------------------------------------------------------------------------------------------
@@ -88,6 +88,7 @@ DEVICE         SIZE     TYPE   MODEL                  FS       STATUS           
 #### What Discovery Checks:
 - **Device Topology:** Probes all attached SATA, SAS, USB, and NVMe drives and partitions via `lsblk`.
 - **Partition & Filesystem State:** Identifies whether drives are raw/unpartitioned, formatted, or have missing filesystems.
+- **Automount & Persistence Awareness:** Detects whether `/etc/fstab` persistence utilizes systemd on-demand automounting (`[✓ auto]`) or legacy static mounting (`[✓]`), correctly recognizing idle automount drives in standby.or have missing filesystems.
 - **Mount & Usage Status:** Distinguishes between active, mounted filesystems and orphaned or unmounted storage.
 - **Active Drive Health:** Extracts mountpoint directory ownership/permissions and ext4 storage efficiency (total inodes, profiles, and root reservation percentage) directly into the summary table.
 - **Smart Recommendations:** Automatically generates tailored, ready-to-run setup commands (pre-filling suggested partitions, labels, and mount points) for any unconfigured drive detected.
@@ -125,8 +126,8 @@ Target Owner:      <username>
 ----------------------------------------------------------------------
 COMPONENT AUDIT:
   [✓] Filesystem (format):         ext4 | UUID: 12345678-abcd-ef01-2345-6789abcdef01 | Label (-l): "storage_pool"
-  [✓] Active Mount (mount):        Mounted at /mnt/storage (-m)
-  [✓] Persistence (fstab):         Valid persistent entry found in /etc/fstab for /mnt/storage
+  [✓] Active Mount (mount):        Mounted at /mnt/storage (-m) (automount active)
+  [✓] Persistence (fstab):         Valid persistent entry found in /etc/fstab for /mnt/storage [automount]
   [✓] Permissions (perms):         Directory exists | Owner (-u): <username> | Perms: 755
 ----------------------------------------------------------------------
 STORAGE EFFICIENCY & ALLOCATION:
@@ -234,11 +235,11 @@ sudo ./drive_setup.py setup <stage> [options]
 
 | Stage | Required Flags | Optional Flags | Description & Cascading Flow |
 | :--- | :--- | :--- | :--- |
-| **`all`** | `-d <dev>`, `-m <path>`, `-l <label>` | `-t`, `-irt`, `-r`, `-u`, `-y`, `-f` | Complete pipeline: Format ➔ Tune ➔ Mount ➔ Fstab ➔ Perms |
-| **`format`** | `-d <dev>`, `-l <label>` | `-m`, `-u`, `-t`, `-irt`, `-r`, `--no-cascade` | Format filesystem; cascades to tune/mount/fstab/perms if `-m` provided |
+| **`all`** | `-d <dev>`, `-m <path>`, `-l <label>` | `-t`, `-irt`, `-r`, `-u`, `-y`, `-f`, `--no-automount` | Complete pipeline: Format ➔ Tune ➔ Mount ➔ Fstab ➔ Perms |
+| **`format`** | `-d <dev>`, `-l <label>` | `-m`, `-u`, `-t`, `-irt`, `-r`, `-f`, `--no-automount`, `--no-cascade` | Format filesystem; cascades to tune/mount/fstab/perms if `-m` provided |
 | **`tune-reserve`**| `-d <dev>`, `-r <pct>` | `-m`, `--no-cascade` | Tune ext4 reserved root blocks (online/offline); cascades if `-m` provided |
-| **`mount`** | `-d <dev>`, `-m <path>` | `-u`, `--no-cascade` | Mount drive and cascade through Fstab and Perms |
-| **`fstab`** | `-d <dev>`, `-m <path>` | `-u`, `--no-cascade` | Configure `/etc/fstab` persistent UUID entry and cascade to Perms |
+| **`mount`** | `-d <dev>`, `-m <path>` | `-u`, `-f`, `--no-automount`, `--no-cascade` | Mount drive and cascade through Fstab and Perms |
+| **`fstab`** | `-d <dev>`, `-m <path>` | `-u`, `-f`, `--no-automount`, `--no-cascade` | Configure `/etc/fstab` persistent UUID entry and cascade to Perms |
 | **`perms`** | `-m <path>` | `-d <dev>`, `-u <user>` | Set mount point ownership and standard `755` permissions |
 
 ---
